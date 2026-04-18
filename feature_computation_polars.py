@@ -307,14 +307,35 @@ def compute_all_features(
             ((pl.col("B08") - pl.col("B05")) / (pl.col("B08") + pl.col("B05")))
             .fill_null(0.0)
             .alias("ndre"),
+            ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04")))
+            .fill_null(0.0)
+            .alias("ndvi"),
+            ((pl.col("B08") - pl.col("B12")) / (pl.col("B08") + pl.col("B12")))
+            .fill_null(0.0)
+            .alias("nbr"),
+            (
+                1.5
+                * (pl.col("B08") - pl.col("B04"))
+                / (pl.col("B08") + pl.col("B04") + 0.5)
+            )
+            .fill_null(0.0)
+            .alias("savi"),
+            ((pl.col("B03") - pl.col("B11")) / (pl.col("B03") + pl.col("B11")))
+            .fill_null(0.0)
+            .alias("mndwi"),
+            (pl.col("B11") / pl.col("B08").clip(lower_bound=1e-6)).alias(
+                "cloud_shadow_ratio"
+            ),
         ]
     )
 
-    for idx in ["evi", "ndmi", "bsi", "ndre"]:
+    for idx in ["evi", "ndmi", "bsi", "ndre", "ndvi", "nbr", "savi"]:
         df = _add_temporal_lazy(df, idx, lookback, min_obs)
 
     for orbit in ["desc", "asc"]:
         df = _add_vv_temporal_lazy(df, f"vv_{orbit}", lookback, min_obs)
+
+    df = _add_yoy_diffs_lazy(df, ["evi", "ndmi", "nbr", "savi"])
 
     df = df.drop(
         [
@@ -325,8 +346,31 @@ def compute_all_features(
     )
 
     df = _add_latent_features_lazy(df)
+    df = _add_alert_consensus_lazy(df)
 
     return df.collect()
+
+
+def _add_yoy_diffs_lazy(
+    df: pl.LazyFrame, idx_names: list, lag_months: int = 12
+) -> pl.LazyFrame:
+    for idx in idx_names:
+        col_lag = pl.col(idx).shift(lag_months).over(["pixel_x", "pixel_y"])
+        df = df.with_columns((pl.col(idx) - col_lag).alias(f"{idx}_yoy_diff"))
+    return df
+
+
+def _add_alert_consensus_lazy(df: pl.LazyFrame) -> pl.LazyFrame:
+    alert_cols = [
+        c
+        for c in ["gladl_alert", "glads2_alert", "radd_alert"]
+        if c in df.collect_schema()
+    ]
+    if not alert_cols:
+        return df
+    exprs = [pl.col(c).fill_null(0.0) for c in alert_cols]
+    mean_expr = pl.mean_horizontal(exprs)
+    return df.with_columns(mean_expr.alias("alert_consensus"))
 
 
 def _add_temporal_lazy(
@@ -551,14 +595,29 @@ def compute_features_pipeline(
             "ndmi",
             "bsi",
             "ndre",
+            "ndvi",
+            "nbr",
+            "savi",
+            "mndwi",
+            "cloud_shadow_ratio",
             "evi_zscore_6mo",
             "ndmi_zscore_6mo",
             "bsi_zscore_6mo",
             "ndre_zscore_6mo",
+            "ndvi_zscore_6mo",
+            "nbr_zscore_6mo",
+            "savi_zscore_6mo",
             "evi_diff_mom",
             "ndmi_diff_mom",
             "bsi_diff_mom",
             "ndre_diff_mom",
+            "ndvi_diff_mom",
+            "nbr_diff_mom",
+            "savi_diff_mom",
+            "evi_yoy_diff",
+            "ndmi_yoy_diff",
+            "nbr_yoy_diff",
+            "savi_yoy_diff",
             "vv_desc",
             "vv_asc",
             "vv_desc_zscore_6mo",
@@ -572,6 +631,7 @@ def compute_features_pipeline(
             "gladl_alert",
             "glads2_alert",
             "radd_alert",
+            "alert_consensus",
         ]
         final = final.select([c for c in output_cols if c in final.columns])
 

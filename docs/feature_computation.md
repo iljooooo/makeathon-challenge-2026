@@ -4,6 +4,8 @@
 
 This document describes the design decisions, reasoning, and methodology for the feature computation pipeline used in the deforestation detection challenge. The pipeline processes multi-source satellite imagery (Sentinel-1, Sentinel-2, and AlphaEarth Foundation embeddings) to generate pixel-level features optimized for machine learning models.
 
+**Key design goal**: Generalize from training data (Asia, South America) to unseen African test data. Training labels are fuzzy alarm-rate signals (RADD, GLAD-L, GLAD-S2), not direct radar readings or true-color photos. The model must handle mountain shadows, cloud contamination, and different vegetation phenologies across continents.
+
 ## Data Sources
 
 | Source | Type | Resolution | Temporal Resolution | Bands/Dimensions |
@@ -17,39 +19,79 @@ This document describes the design decisions, reasoning, and methodology for the
 
 ### 1. Optical Indices (Sentinel-2)
 
-Derived from spectral bands to capture vegetation health, moisture, and soil characteristics.
+Each index was verified against USGS and peer-reviewed literature. Only indices with clear, distinct informational value are included.
 
 #### Enhanced Vegetation Index (EVI)
 ```
 EVI = 2.5 * (B08 - B04) / (B08 + 6*B04 - 7.5*B02 + 1)
 ```
-- **Purpose**: Vegetation vigor with improved sensitivity in high-biomass regions
-- **Why not NDVI?**: EVI reduces atmospheric influence and soil background effects
+- **Source**: Huete et al. 2002; USGS Landsat EVI product
+- **Purpose**: Vegetation vigor with atmospheric and soil background correction
 - **Key bands**: B08 (NIR), B04 (Red), B02 (Blue)
 
 #### Normalized Difference Moisture Index (NDMI)
 ```
 NDMI = (B08 - B11) / (B08 + B11)
 ```
-- **Purpose**: Vegetation water content and stress detection
+- **Source**: Gao 1996; USGS Landsat NDMI product
 - **Deforestation signal**: Dead/drying vegetation shows lower NDMI
-- **Key bands**: B08 (NIR), B11 (SWIR)
+- **Key bands**: B08 (NIR), B11 (SWIR1)
 
 #### Bare Soil Index (BSI)
 ```
 BSI = ((B11 + B04) - (B08 + B02)) / ((B11 + B04) + (B08 + B02))
 ```
-- **Purpose**: Exposed soil detection
+- **Source**: Rikimaru et al. 2002
 - **Deforestation signal**: Cleared areas transition from negative (vegetation) to positive (bare soil)
-- **Key bands**: B11 (SWIR), B04 (Red), B08 (NIR), B02 (Blue)
+- **Key bands**: B11 (SWIR1), B04 (Red), B08 (NIR), B02 (Blue)
 
 #### Normalized Difference Red Edge (NDRE)
 ```
 NDRE = (B08 - B05) / (B08 + B05)
 ```
-- **Purpose**: Chlorophyll content and leaf area estimation
-- **Advantage**: Red-edge band (B05) is sensitive to vegetation stress before visible symptoms
+- **Source**: Gitelson et al. 2003
+- **Purpose**: Chlorophyll content; red-edge is sensitive to pre-visible stress
 - **Key bands**: B08 (NIR), B05 (Red Edge)
+
+#### Normalized Difference Vegetation Index (NDVI)
+```
+NDVI = (B08 - B04) / (B08 + B04)
+```
+- **Source**: Rouse et al. 1974; USGS Landsat NDVI product
+- **Why alongside EVI?**: NDVI and EVI saturate differently. NDVI is more sensitive in low-biomass (African savanna) regions; EVI in high-biomass (tropical forest). Complementary.
+- **Key bands**: B08 (NIR), B04 (Red)
+
+#### Normalized Burn Ratio (NBR)
+```
+NBR = (B08 - B12) / (B08 + B12)
+```
+- **Source**: Key & Benson 2006 (USGS FIREMON); USGS Landsat NBR product
+- **Purpose**: Detect burn scars and fire-related deforestation (slash-and-burn, wildfire)
+- **Deforestation signal**: Burned areas show strong NBR decrease
+- **Key bands**: B08 (NIR), B12 (SWIR2)
+
+#### Soil-Adjusted Vegetation Index (SAVI)
+```
+SAVI = 1.5 * (B08 - B04) / (B08 + B04 + 0.5)
+```
+- **Source**: Huete 1988; USGS Landsat SAVI product (L=0.5)
+- **Purpose**: Vegetation index correcting for soil brightness — critical for Africa's savannas where soil background is prominent
+- **Key bands**: B08 (NIR), B04 (Red)
+
+#### Modified Normalized Difference Water Index (MNDWI)
+```
+MNDWI = (B03 - B11) / (B03 + B11)
+```
+- **Source**: Xu 2006
+- **Purpose**: Water body detection; suppresses built-up noise. SWIR (B11) replaces NIR to reduce mountain-shadow false positives
+- **Mountain/generalization advantage**: Cloud shadows have very low NIR but relatively higher SWIR, so MNDWI (using SWIR) is better than NDWI at distinguishing shadow from water
+- **Key bands**: B03 (Green), B11 (SWIR1)
+
+#### Cloud Shadow Ratio
+```
+cloud_shadow_ratio = B11 / B08
+```
+- **Purpose**: Proxy feature to help the model distinguish cloud/mountain shadows from true deforestation. Cloud shadows suppress B08 (NIR) much more than B11 (SWIR), producing high ratios. True vegetation has lower ratios.
 
 ### 2. Temporal Features
 
@@ -57,18 +99,24 @@ NDRE = (B08 - B05) / (B08 + B05)
 ```
 z_score = (current - hist_mean) / hist_std
 ```
-- **Purpose**: Detect deviations from historical baseline
-- **Window**: Configurable (default: 6 months lookback)
-- **Minimum observations**: 3 (to ensure statistical reliability)
-- **Why rolling window?**: Captures gradual degradation trends, not just sudden changes
+- **Window**: 6-month lookback, minimum 3 observations
+- **Applied to**: evi, ndmi, bsi, ndre, ndvi, nbr, savi
 
 #### Month-over-Month Difference
 ```
-diff = current - previous
+diff = current - previous_month
 ```
-- **Purpose**: Capture sudden changes (logging events, fires)
-- **Wraparound handling**: December to January transition across years
-- **Why both z-score and diff?**: Z-scores capture sustained anomalies; diffs capture transient events
+- **Applied to**: evi, ndmi, bsi, ndre, ndvi, nbr, savi
+
+#### Year-over-Year Same-Month Difference
+```
+yoy_diff = current_month - same_month_last_year
+```
+- **Source**: Standard remote sensing change detection methodology
+- **Purpose**: Season-cycle-corrected change — compares same phenological state, eliminating seasonal confounds
+- **Africa generalization**: Critical across biomes with different dry/wet seasonality
+- **Fallback**: If prior-year same month unavailable, tries 2-year lag
+- **Applied to**: evi, ndmi, nbr, savi
 
 ### 3. Radar Features (Sentinel-1)
 
@@ -76,132 +124,27 @@ diff = current - previous
 ```
 roughness_drop = max(historical_median - current, 0)
 ```
-- **Purpose**: Surface roughness change detection
-- **Deforestation signal**: Deforested areas become smoother (less backscatter), showing positive roughness drop
-- **Orbit handling**: Ascending and descending kept as separate columns (different viewing geometries)
-
-#### Spatial Alignment
-- **Method**: Bilinear interpolation resampling via `rasterio.warp.reproject`
-- **Why bilinear?**: Gentle low-pass filter that smooths speckle noise while preserving structural edges
-- **Master grid**: Sentinel-2 10m grid (1002x1002 pixels)
+- S1 RTC data is terrain-corrected and cloud-penetrating; inherently robust for mountains
 
 ### 4. Latent Space Features (AlphaEarth Embeddings)
 
 #### Year-over-Year Cosine Distance
 ```
-latent_shift = 1 - cos_similarity(embedding_t, embedding_t_minus_1)
+latent_shift = 1 - cos_similarity(embedding_t, embedding_t_minus_k)
 ```
-- **Purpose**: Detect semantic changes in the learned representation
-- **Advantage**: Captures complex multi-spectral patterns not expressible as simple indices
-- **Two-year lookback**: Separate features for 1-year and 2-year shifts
 
 ### 5. Labels (Training Data Only)
 
 Three independent alert systems with yearly columns (2021-2025):
-- **GLAD-L**: Landsat-based alerts
-- **GLAD-S2**: Sentinel-2-based alerts  
-- **RADD**: Radar-based deforestation alerts
+- **GLAD-L**: 0=no loss, 2=probable, 3=confirmed
+- **GLAD-S2**: 0-4 confidence scale
+- **RADD**: 2=low confidence, 3=high confidence + date
 
-## Data Model
-
-### TileData Structure
-```python
-@dataclass
-class TileData:
-    tile_id: str           # e.g., "18NWG_6_6"
-    split: str             # "train" or "test"
-    s2_data: Dict          # {(year, month): {B02, B04, ...}}
-    s1_data: Dict          # {(year, month, orbit): array}
-    aef_data: Dict         # {year: 64-band array}
-    labels: Dict           # {system: {year: array}}
-    reference_shape: Tuple # (height, width)
+#### Alert Consensus
 ```
-
-### TileFeatures Structure
-```python
-@dataclass
-class TileFeatures:
-    tile_id: str
-    year: int
-    month: int
-    split: str
-    # Optical indices
-    evi, ndmi, bsi, ndre: np.ndarray
-    # Temporal features
-    *_zscore, *_diff: np.ndarray
-    # Radar features
-    vv_desc, vv_asc, vv_*: np.ndarray
-    # Latent features
-    latent_yoy_1y, latent_yoy_2y: np.ndarray
-    # Labels
-    gladl_alert, glads2_alert, radd_alert: np.ndarray
+alert_consensus = mean(gladl_alert, glads2_alert, radd_alert)
 ```
-
-## Processing Pipeline
-
-### Main Function: `compute_features_pipeline()`
-
-```python
-compute_features_pipeline(
-    data_dir: Path = "./data/makeathon-challenge",
-    output_path: Path = "./features.parquet",
-    sample_fraction: float = 1.0,
-    seed: int = 42,
-    window_config: dict = {"lookback_months": 6, "min_observations": 3}
-) -> pl.DataFrame
-```
-
-### Sampling Strategy
-- **Sample fraction**: If < 1.0, randomly sample a subset of tiles
-- **Fixed seed**: Ensures reproducibility (default: 42)
-- **Complete temporal domain**: When sampling, selected tiles are processed with all their timesteps
-
-### Processing Flow
-
-```
-1. Discover tiles from sentinel-2/train and sentinel-2/test directories
-2. Optionally shuffle and sample (if sample_fraction < 1.0)
-3. For each tile:
-   a. Load all data sources (S2, S1, AEF, labels)
-   b. Upsample S1 to S2 grid using bilinear interpolation
-   c. For each (year, month) timestep:
-      - Compute optical indices
-      - Compute temporal features (z-scores, diffs)
-      - Compute radar features
-      - Compute latent space shifts
-      - Attach labels (train only)
-      - Flatten pixels to rows
-   d. Accumulate DataFrames
-4. Concatenate all rows
-5. Write to parquet
-```
-
-## Modular Functions for Interactive Use
-
-The pipeline is decomposed into modular functions for Jupyter notebook exploration:
-
-### Single-Tile Loading
-```python
-tile_data = load_tile(data_dir, tile_id="18NWG_6_6", split="train")
-```
-
-### Single-Timestep Feature Computation
-```python
-features = compute_timestep_features(
-    tile_data, 
-    year=2023, 
-    month=6,
-    window_config={"lookback_months": 6, "min_observations": 3}
-)
-```
-
-### Visualization-Ready Output
-```python
-# Access 2D arrays directly for heatmaps
-plt.imshow(features.evi)
-plt.imshow(features.vv_roughness_drop_desc)
-plt.imshow(features.latent_yoy_1y)
-```
+- Soft voting across all three noisy label sources
 
 ## Output Schema
 
@@ -217,16 +160,43 @@ plt.imshow(features.latent_yoy_1y)
 | `ndmi` | float32 | Normalized Moisture Index |
 | `bsi` | float32 | Bare Soil Index |
 | `ndre` | float32 | Red Edge Index |
-| `evi_zscore_6mo` | float32 | 6-month rolling z-score |
-| `evi_diff_mom` | float32 | Month-over-month difference |
+| `ndvi` | float32 | Normalized Difference Vegetation Index |
+| `nbr` | float32 | Normalized Burn Ratio |
+| `savi` | float32 | Soil-Adjusted Vegetation Index |
+| `mndwi` | float32 | Modified NDWI |
+| `cloud_shadow_ratio` | float32 | B11/B08 — cloud/shadow proxy |
+| `*_zscore_6mo` | float32 | 6-month rolling z-score (7 indices) |
+| `*_diff_mom` | float32 | Month-over-month difference (7 indices) |
+| `*_yoy_diff` | float32 | Year-over-year same-month diff (evi,ndmi,nbr,savi) |
 | `vv_desc` | float32 | VV descending backscatter |
 | `vv_asc` | float32 | VV ascending backscatter |
 | `vv_*_zscore_6mo` | float32 | Radar z-scores |
-| `vv_*_diff_mom` | float32 | radar differences |
+| `vv_*_diff_mom` | float32 | Radar differences |
 | `vv_roughness_drop_*` | float32 | Roughness drop signal |
 | `latent_shift_yoy_1y` | float32 | 1-year latent shift |
 | `latent_shift_yoy_2y` | float32 | 2-year latent shift |
 | `*_alert` | float32 | Alert labels (NaN for test) |
+| `alert_consensus` | float32 | Mean of 3 alert systems |
+
+## Index Selection Rationale
+
+| Index | Kept? | Rationale |
+|-------|-------|-----------|
+| EVI | Yes | Core vegetation index; corrects atmospheric + soil background |
+| NDMI | Yes | Moisture stress — unique info (NIR vs SWIR1) |
+| BSI | Yes | Only direct soil exposure signal |
+| NDRE | Yes | Only red-edge index — early stress detection |
+| NDVI | Yes | Complements EVI in low-biomass (savanna) environments |
+| NBR | Yes | Only burn scar index — essential for fire-related deforestation |
+| SAVI | Yes | Only soil-corrected vegetation index — key for African savannas |
+| MNDWI | Yes | Water detection with mountain shadow suppression |
+| cloud_shadow_ratio | Yes | Only cloud/shadow proxy feature |
+| NBR2 | **Cut** | Near-redundant with NBR for deforestation |
+| MSAVI2 | **Cut** | Redundant with SAVI; buggy impl |
+| NDWI | **Cut** | MNDWI strictly supersedes it for shadow rejection |
+| VARI | **Cut** | Marginal on L2A data (already atmospherically corrected) |
+| brightness | **Cut** | Redundant with EVI (same bands) |
+| swir_nir_ratio | **Cut** | Redundant with cloud_shadow_ratio (both SWIR/NIR) |
 
 ## Edge Cases and Handling
 
@@ -236,34 +206,12 @@ plt.imshow(features.latent_yoy_1y)
 | Missing AEF year | NaN in latent columns |
 | Insufficient historical observations | NaN in z-score columns |
 | Missing previous month | NaN in diff columns |
+| Missing YoY same-month | NaN in yoy_diff columns |
 | Test split | NaN in label columns |
 | Band division by zero | 0.0 (safe division) |
 
 ## Performance Considerations
 
-### Memory Management
 - **Tile-by-tile processing**: Each tile processed independently to bound memory
-- **Estimated output**: ~16M rows × 32 columns ≈ 2GB raw, ~500MB compressed parquet
-- **Streaming option**: Future enhancement for incremental parquet writes
-
-### Computation Optimization
-- **Vectorized numpy**: All computations use array operations
-- **Lazy historical stack**: Only computed when needed for z-scores
-- **Polars DataFrame**: Efficient columnar storage and concatenation
-
-### I/O Optimization
-- **Parquet format**: Columnar compression, efficient reads for ML
-- **Single output file**: Simplicity for downstream training scripts
-
-## Design Decisions Summary
-
-| Decision | Rationale |
-|----------|-----------|
-| Pixel-level granularity | Enable pixel-wise ML models; finer than tile aggregates |
-| Separate orbit columns | Different viewing geometries; model can learn orbit-specific patterns |
-| Rolling window + diff | Capture both sustained trends and transient events |
-| Bilinear resampling | Smooths speckle noise while preserving edges |
-| NaN for missing data | Explicit missingness; models can learn to ignore |
-| Configurable window | Flexibility for hyperparameter tuning |
-| 6-month lookback | Balance between signal strength and temporal relevance |
-| Min 3 observations | Statistical reliability for z-score calculation |
+- **Estimated output**: ~16M rows × 40 columns ≈ 2.5GB raw, ~600MB compressed parquet
+- **Vectorized numpy/polars**: All computations use array operations

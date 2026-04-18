@@ -41,14 +41,29 @@ class TileFeatures:
     ndmi: np.ndarray = None
     bsi: np.ndarray = None
     ndre: np.ndarray = None
+    ndvi: np.ndarray = None
+    nbr: np.ndarray = None
+    savi: np.ndarray = None
+    mndwi: np.ndarray = None
+    cloud_shadow_ratio: np.ndarray = None
     evi_zscore: np.ndarray = None
     ndmi_zscore: np.ndarray = None
     bsi_zscore: np.ndarray = None
     ndre_zscore: np.ndarray = None
+    ndvi_zscore: np.ndarray = None
+    nbr_zscore: np.ndarray = None
+    savi_zscore: np.ndarray = None
     evi_diff: np.ndarray = None
     ndmi_diff: np.ndarray = None
     bsi_diff: np.ndarray = None
     ndre_diff: np.ndarray = None
+    ndvi_diff: np.ndarray = None
+    nbr_diff: np.ndarray = None
+    savi_diff: np.ndarray = None
+    evi_yoy_diff: np.ndarray = None
+    ndmi_yoy_diff: np.ndarray = None
+    nbr_yoy_diff: np.ndarray = None
+    savi_yoy_diff: np.ndarray = None
     vv_desc: np.ndarray = None
     vv_asc: np.ndarray = None
     vv_desc_zscore: np.ndarray = None
@@ -62,6 +77,7 @@ class TileFeatures:
     gladl_alert: np.ndarray = None
     glads2_alert: np.ndarray = None
     radd_alert: np.ndarray = None
+    alert_consensus: np.ndarray = None
 
 
 def compute_evi(b02: np.ndarray, b04: np.ndarray, b08: np.ndarray) -> np.ndarray:
@@ -86,6 +102,31 @@ def compute_bsi(
 def compute_ndre(b05: np.ndarray, b08: np.ndarray) -> np.ndarray:
     denominator = b08 + b05
     return np.where(denominator != 0, (b08 - b05) / denominator, 0.0)
+
+
+def compute_ndvi(b04: np.ndarray, b08: np.ndarray) -> np.ndarray:
+    denominator = b08 + b04
+    return np.where(denominator != 0, (b08 - b04) / denominator, 0.0)
+
+
+def compute_nbr(b08: np.ndarray, b12: np.ndarray) -> np.ndarray:
+    denominator = b08 + b12
+    return np.where(denominator != 0, (b08 - b12) / denominator, 0.0)
+
+
+def compute_savi(b04: np.ndarray, b08: np.ndarray) -> np.ndarray:
+    denominator = b08 + b04 + 0.5
+    return np.where(denominator != 0, 1.5 * (b08 - b04) / denominator, 0.0)
+
+
+def compute_mndwi(b03: np.ndarray, b11: np.ndarray) -> np.ndarray:
+    denominator = b03 + b11
+    return np.where(denominator != 0, (b03 - b11) / denominator, 0.0)
+
+
+def compute_cloud_shadow_ratio(b08: np.ndarray, b11: np.ndarray) -> np.ndarray:
+    denominator = np.maximum(b08, 1e-6)
+    return b11 / denominator
 
 
 def compute_vv_roughness_drop(
@@ -120,6 +161,27 @@ def compute_first_order_difference(
     return current_val - previous_val
 
 
+def compute_yoy_same_month_diff(
+    current_indices: Dict[str, np.ndarray],
+    yoy_indices: Optional[Dict[str, np.ndarray]],
+    index_names: List[str] = None,
+) -> Dict[str, np.ndarray]:
+    if index_names is None:
+        index_names = ["evi", "ndmi", "nbr", "savi"]
+    features = {}
+    for idx_name in index_names:
+        if yoy_indices and idx_name in yoy_indices and idx_name in current_indices:
+            features[f"{idx_name}_yoy_diff"] = (
+                current_indices[idx_name] - yoy_indices[idx_name]
+            )
+        else:
+            ref = current_indices.get(idx_name)
+            features[f"{idx_name}_yoy_diff"] = (
+                nan_array(ref.shape) if ref is not None else None
+            )
+    return features
+
+
 def upsample_and_align_radar(
     source_data: np.ndarray,
     source_transform: Any,
@@ -150,6 +212,13 @@ def compute_optical_indices(s2_bands: Dict[str, np.ndarray]) -> Dict[str, np.nda
             s2_bands["B02"], s2_bands["B04"], s2_bands["B08"], s2_bands["B11"]
         ),
         "ndre": compute_ndre(s2_bands["B05"], s2_bands["B08"]),
+        "ndvi": compute_ndvi(s2_bands["B04"], s2_bands["B08"]),
+        "nbr": compute_nbr(s2_bands["B08"], s2_bands["B12"]),
+        "savi": compute_savi(s2_bands["B04"], s2_bands["B08"]),
+        "mndwi": compute_mndwi(s2_bands["B03"], s2_bands["B11"]),
+        "cloud_shadow_ratio": compute_cloud_shadow_ratio(
+            s2_bands["B08"], s2_bands["B11"]
+        ),
     }
 
 
@@ -160,7 +229,7 @@ def compute_optical_temporal_features(
     min_observations: int = 3,
 ) -> Dict[str, np.ndarray]:
     features = {}
-    for idx_name in ["evi", "ndmi", "bsi", "ndre"]:
+    for idx_name in ["evi", "ndmi", "bsi", "ndre", "ndvi", "nbr", "savi"]:
         current = current_indices[idx_name]
         hist_stack = historical_indices_stack.get(idx_name)
         features[f"{idx_name}_zscore"] = (
@@ -574,7 +643,10 @@ def compute_timestep_features(
 
     historical_months = get_historical_timesteps(all_timesteps, year, month, lookback)
     hist_stack = _build_historical_indices_stack(
-        tile_data, historical_months, ["evi", "ndmi", "bsi", "ndre"], min_obs
+        tile_data,
+        historical_months,
+        ["evi", "ndmi", "bsi", "ndre", "ndvi", "nbr", "savi"],
+        min_obs,
     )
 
     prev_month = get_previous_timestep(all_timesteps, year, month)
@@ -597,6 +669,28 @@ def compute_timestep_features(
         current_indices, hist_stack, prev_indices, min_obs
     )
 
+    yoy_month = None
+    if year > 2020 and (year - 1, month) in tile_data.s2_data:
+        yoy_month = (year - 1, month)
+    elif year > 2021 and (year - 2, month) in tile_data.s2_data:
+        yoy_month = (year - 2, month)
+
+    yoy_indices = (
+        compute_optical_indices(tile_data.s2_data[yoy_month])
+        if yoy_month and yoy_month in tile_data.s2_data
+        else None
+    )
+    if yoy_indices is not None:
+        for idx_name, arr in yoy_indices.items():
+            if arr.shape != ref_shape:
+                print(
+                    f"[WARN] {tile_data.tile_id} {year}-{month}: yoy {idx_name} shape {arr.shape} != ref {ref_shape}"
+                )
+                yoy_indices = None
+                break
+
+    yoy_diffs = compute_yoy_same_month_diff(current_indices, yoy_indices)
+
     vv_features = {}
     for orbit in ["descending", "ascending"]:
         vv_features[orbit] = _build_radar_features_for_orbit(
@@ -617,6 +711,14 @@ def compute_timestep_features(
         else {f"{s}_alert": nan_array(ref_shape) for s in ["gladl", "glads2", "radd"]}
     )
 
+    alert_stack = np.stack(
+        [
+            np.nan_to_num(labels.get(f"{s}_alert", nan_array(ref_shape)), nan=0.0)
+            for s in ["gladl", "glads2", "radd"]
+        ]
+    )
+    alert_consensus = np.mean(alert_stack, axis=0)
+
     return TileFeatures(
         tile_id=tile_data.tile_id,
         year=year,
@@ -626,14 +728,29 @@ def compute_timestep_features(
         ndmi=current_indices["ndmi"],
         bsi=current_indices["bsi"],
         ndre=current_indices["ndre"],
+        ndvi=current_indices["ndvi"],
+        nbr=current_indices["nbr"],
+        savi=current_indices["savi"],
+        mndwi=current_indices["mndwi"],
+        cloud_shadow_ratio=current_indices["cloud_shadow_ratio"],
         evi_zscore=optical_temporal["evi_zscore"],
         ndmi_zscore=optical_temporal["ndmi_zscore"],
         bsi_zscore=optical_temporal["bsi_zscore"],
         ndre_zscore=optical_temporal["ndre_zscore"],
+        ndvi_zscore=optical_temporal["ndvi_zscore"],
+        nbr_zscore=optical_temporal["nbr_zscore"],
+        savi_zscore=optical_temporal["savi_zscore"],
         evi_diff=optical_temporal["evi_diff"],
         ndmi_diff=optical_temporal["ndmi_diff"],
         bsi_diff=optical_temporal["bsi_diff"],
         ndre_diff=optical_temporal["ndre_diff"],
+        ndvi_diff=optical_temporal["ndvi_diff"],
+        nbr_diff=optical_temporal["nbr_diff"],
+        savi_diff=optical_temporal["savi_diff"],
+        evi_yoy_diff=yoy_diffs.get("evi_yoy_diff", nan_array(ref_shape)),
+        ndmi_yoy_diff=yoy_diffs.get("ndmi_yoy_diff", nan_array(ref_shape)),
+        nbr_yoy_diff=yoy_diffs.get("nbr_yoy_diff", nan_array(ref_shape)),
+        savi_yoy_diff=yoy_diffs.get("savi_yoy_diff", nan_array(ref_shape)),
         vv_desc=vv_features["descending"].get("vv_current", nan_array(ref_shape)),
         vv_asc=vv_features["ascending"].get("vv_current", nan_array(ref_shape)),
         vv_desc_zscore=vv_features["descending"].get("vv_zscore", nan_array(ref_shape)),
@@ -651,6 +768,7 @@ def compute_timestep_features(
         gladl_alert=labels["gladl_alert"],
         glads2_alert=labels["glads2_alert"],
         radd_alert=labels["radd_alert"],
+        alert_consensus=alert_consensus,
     )
 
 
@@ -687,14 +805,31 @@ def tile_features_to_dataframe(features: TileFeatures) -> pl.DataFrame:
             "ndmi": safe_flatten(features.ndmi, "ndmi"),
             "bsi": safe_flatten(features.bsi, "bsi"),
             "ndre": safe_flatten(features.ndre, "ndre"),
+            "ndvi": safe_flatten(features.ndvi, "ndvi"),
+            "nbr": safe_flatten(features.nbr, "nbr"),
+            "savi": safe_flatten(features.savi, "savi"),
+            "mndwi": safe_flatten(features.mndwi, "mndwi"),
+            "cloud_shadow_ratio": safe_flatten(
+                features.cloud_shadow_ratio, "cloud_shadow_ratio"
+            ),
             "evi_zscore_6mo": safe_flatten(features.evi_zscore, "evi_zscore"),
             "ndmi_zscore_6mo": safe_flatten(features.ndmi_zscore, "ndmi_zscore"),
             "bsi_zscore_6mo": safe_flatten(features.bsi_zscore, "bsi_zscore"),
             "ndre_zscore_6mo": safe_flatten(features.ndre_zscore, "ndre_zscore"),
+            "ndvi_zscore_6mo": safe_flatten(features.ndvi_zscore, "ndvi_zscore"),
+            "nbr_zscore_6mo": safe_flatten(features.nbr_zscore, "nbr_zscore"),
+            "savi_zscore_6mo": safe_flatten(features.savi_zscore, "savi_zscore"),
             "evi_diff_mom": safe_flatten(features.evi_diff, "evi_diff"),
             "ndmi_diff_mom": safe_flatten(features.ndmi_diff, "ndmi_diff"),
             "bsi_diff_mom": safe_flatten(features.bsi_diff, "bsi_diff"),
             "ndre_diff_mom": safe_flatten(features.ndre_diff, "ndre_diff"),
+            "ndvi_diff_mom": safe_flatten(features.ndvi_diff, "ndvi_diff"),
+            "nbr_diff_mom": safe_flatten(features.nbr_diff, "nbr_diff"),
+            "savi_diff_mom": safe_flatten(features.savi_diff, "savi_diff"),
+            "evi_yoy_diff": safe_flatten(features.evi_yoy_diff, "evi_yoy_diff"),
+            "ndmi_yoy_diff": safe_flatten(features.ndmi_yoy_diff, "ndmi_yoy_diff"),
+            "nbr_yoy_diff": safe_flatten(features.nbr_yoy_diff, "nbr_yoy_diff"),
+            "savi_yoy_diff": safe_flatten(features.savi_yoy_diff, "savi_yoy_diff"),
             "vv_desc": safe_flatten(features.vv_desc, "vv_desc"),
             "vv_asc": safe_flatten(features.vv_asc, "vv_asc"),
             "vv_desc_zscore_6mo": safe_flatten(
@@ -718,6 +853,9 @@ def tile_features_to_dataframe(features: TileFeatures) -> pl.DataFrame:
             "gladl_alert": safe_flatten(features.gladl_alert, "gladl_alert"),
             "glads2_alert": safe_flatten(features.glads2_alert, "glads2_alert"),
             "radd_alert": safe_flatten(features.radd_alert, "radd_alert"),
+            "alert_consensus": safe_flatten(
+                features.alert_consensus, "alert_consensus"
+            ),
         }
     )
 
