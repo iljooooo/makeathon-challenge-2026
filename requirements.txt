@@ -10,3 +10,4 @@ tqdm~=4.66
 ipykernel
 jupyter
 polars
+earthengine-api
