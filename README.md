@@ -1,5 +1,5 @@
 # osapiens Challenge Makeathon 2026
-
+# This branch adds a few additional features/indices that might be useful for sparse vegetation. 
 ## Detecting Deforestation from Space
 
 ![Deforestation event example](content/deforestation.png)
