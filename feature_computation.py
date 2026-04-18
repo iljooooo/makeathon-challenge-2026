@@ -10,7 +10,7 @@ import re
 import random
 
 SEED = 42
-SAMPLE_FRACTION = 1
+SAMPLE_FRACTION = 0.1
 S2_BANDS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
 
 
@@ -283,15 +283,41 @@ def load_tile(
             _, year, month = parsed
             with rasterio.open(f) as src:
                 arr = src.read().astype(np.float32)
-                bands = {name: arr[i] for i, name in enumerate(S2_BANDS, start=1)}
-                bands.update(
-                    {"transform": src.transform, "crs": src.crs, "shape": src.shape}
-                )
-                s2_data[(year, month)] = bands
+                current_shape = src.shape
+
                 if reference_transform is None:
                     reference_transform = src.transform
                     reference_crs = src.crs
-                    reference_shape = src.shape
+                    reference_shape = current_shape
+                elif current_shape != reference_shape:
+                    print(
+                        f"[WARN] {tile_id} {year}-{month}: S2 shape {current_shape} != reference {reference_shape}, resampling..."
+                    )
+                    resampled = np.empty(
+                        (arr.shape[0], *reference_shape), dtype=np.float32
+                    )
+                    for band_idx in range(arr.shape[0]):
+                        reproject(
+                            source=arr[band_idx],
+                            destination=resampled[band_idx],
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=reference_transform,
+                            dst_crs=reference_crs,
+                            resampling=Resampling.bilinear,
+                            nodata=np.nan,
+                        )
+                    arr = resampled
+
+                bands = {name: arr[i] for i, name in enumerate(S2_BANDS, start=1)}
+                bands.update(
+                    {
+                        "transform": reference_transform,
+                        "crs": reference_crs,
+                        "shape": reference_shape,
+                    }
+                )
+                s2_data[(year, month)] = bands
 
     s1_data = {}
     s1_tile_dir = s1_dir / f"{tile_id}__s1_rtc"
@@ -431,12 +457,28 @@ def _build_historical_indices_stack(
     min_obs: int,
 ) -> Dict[str, np.ndarray]:
     stack = {idx: [] for idx in index_names}
+    ref_shape = tile_data.reference_shape
     for hy, hm in historical_months:
         if (hy, hm) in tile_data.s2_data:
             indices = compute_optical_indices(tile_data.s2_data[(hy, hm)])
             for idx_name in index_names:
-                stack[idx_name].append(indices[idx_name])
-    return {idx: np.stack(vals) for idx, vals in stack.items() if len(vals) >= min_obs}
+                arr = indices[idx_name]
+                if arr.shape != ref_shape:
+                    print(
+                        f"[WARN] Historical {hy}-{hm} {idx_name} shape {arr.shape} != reference {ref_shape}, skipping"
+                    )
+                    continue
+                stack[idx_name].append(arr)
+    result = {}
+    for idx, vals in stack.items():
+        if len(vals) >= min_obs:
+            stacked = np.stack(vals)
+            if stacked.shape[1:] != ref_shape:
+                print(
+                    f"[ERROR] Stacked {idx} has shape {stacked.shape}, expected (*, {ref_shape[0]}, {ref_shape[1]})"
+                )
+            result[idx] = stacked
+    return result
 
 
 def _build_radar_features_for_orbit(
@@ -510,7 +552,26 @@ def compute_timestep_features(
             tile_id=tile_data.tile_id, year=year, month=month, split=tile_data.split
         )
 
+    for band_name in S2_BANDS:
+        if band_name in s2_month and s2_month[band_name].shape != ref_shape:
+            print(
+                f"[ERROR] {tile_data.tile_id} {year}-{month}: {band_name} shape {s2_month[band_name].shape} != ref {ref_shape}"
+            )
+            return TileFeatures(
+                tile_id=tile_data.tile_id, year=year, month=month, split=tile_data.split
+            )
+
     current_indices = compute_optical_indices(s2_month)
+
+    for idx_name, arr in current_indices.items():
+        if arr.shape != ref_shape:
+            print(
+                f"[ERROR] {tile_data.tile_id} {year}-{month}: computed {idx_name} shape {arr.shape} != ref {ref_shape}"
+            )
+            return TileFeatures(
+                tile_id=tile_data.tile_id, year=year, month=month, split=tile_data.split
+            )
+
     historical_months = get_historical_timesteps(all_timesteps, year, month, lookback)
     hist_stack = _build_historical_indices_stack(
         tile_data, historical_months, ["evi", "ndmi", "bsi", "ndre"], min_obs
@@ -522,6 +583,16 @@ def compute_timestep_features(
         if prev_month and prev_month in tile_data.s2_data
         else None
     )
+
+    if prev_indices is not None:
+        for idx_name, arr in prev_indices.items():
+            if arr.shape != ref_shape:
+                print(
+                    f"[WARN] {tile_data.tile_id} {year}-{month}: prev {idx_name} shape {arr.shape} != ref {ref_shape}"
+                )
+                prev_indices = None
+                break
+
     optical_temporal = compute_optical_temporal_features(
         current_indices, hist_stack, prev_indices, min_obs
     )
@@ -589,47 +660,64 @@ def tile_features_to_dataframe(features: TileFeatures) -> pl.DataFrame:
         return pl.DataFrame()
 
     height, width = evi.shape
+    expected_size = height * width
     pixel_y, pixel_x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
 
-    def safe_flatten(arr):
+    def safe_flatten(arr, name=None):
         if arr is None:
-            return np.full(height * width, np.nan, dtype=np.float32)
-        return arr.flatten().astype(np.float32)
+            return np.full(expected_size, np.nan, dtype=np.float32)
+        flat = arr.flatten().astype(np.float32)
+        if len(flat) != expected_size:
+            print(
+                f"[ERROR] {features.tile_id} {features.year}-{features.month}: {name} has {len(flat)} elements, expected {expected_size}"
+            )
+            return np.full(expected_size, np.nan, dtype=np.float32)
+        return flat
 
     return pl.DataFrame(
         {
-            "tile_id": [features.tile_id] * (height * width),
+            "tile_id": [features.tile_id] * expected_size,
             "split": [features.split if hasattr(features, "split") else "unknown"]
-            * (height * width),
-            "year": [features.year] * (height * width),
-            "month": [features.month] * (height * width),
+            * expected_size,
+            "year": [features.year] * expected_size,
+            "month": [features.month] * expected_size,
             "pixel_x": pixel_x.flatten().astype(np.int32),
             "pixel_y": pixel_y.flatten().astype(np.int32),
-            "evi": safe_flatten(features.evi),
-            "ndmi": safe_flatten(features.ndmi),
-            "bsi": safe_flatten(features.bsi),
-            "ndre": safe_flatten(features.ndre),
-            "evi_zscore_6mo": safe_flatten(features.evi_zscore),
-            "ndmi_zscore_6mo": safe_flatten(features.ndmi_zscore),
-            "bsi_zscore_6mo": safe_flatten(features.bsi_zscore),
-            "ndre_zscore_6mo": safe_flatten(features.ndre_zscore),
-            "evi_diff_mom": safe_flatten(features.evi_diff),
-            "ndmi_diff_mom": safe_flatten(features.ndmi_diff),
-            "bsi_diff_mom": safe_flatten(features.bsi_diff),
-            "ndre_diff_mom": safe_flatten(features.ndre_diff),
-            "vv_desc": safe_flatten(features.vv_desc),
-            "vv_asc": safe_flatten(features.vv_asc),
-            "vv_desc_zscore_6mo": safe_flatten(features.vv_desc_zscore),
-            "vv_asc_zscore_6mo": safe_flatten(features.vv_asc_zscore),
-            "vv_desc_diff_mom": safe_flatten(features.vv_desc_diff),
-            "vv_asc_diff_mom": safe_flatten(features.vv_asc_diff),
-            "vv_roughness_drop_desc": safe_flatten(features.vv_roughness_drop_desc),
-            "vv_roughness_drop_asc": safe_flatten(features.vv_roughness_drop_asc),
-            "latent_shift_yoy_1y": safe_flatten(features.latent_yoy_1y),
-            "latent_shift_yoy_2y": safe_flatten(features.latent_yoy_2y),
-            "gladl_alert": safe_flatten(features.gladl_alert),
-            "glads2_alert": safe_flatten(features.glads2_alert),
-            "radd_alert": safe_flatten(features.radd_alert),
+            "evi": safe_flatten(features.evi, "evi"),
+            "ndmi": safe_flatten(features.ndmi, "ndmi"),
+            "bsi": safe_flatten(features.bsi, "bsi"),
+            "ndre": safe_flatten(features.ndre, "ndre"),
+            "evi_zscore_6mo": safe_flatten(features.evi_zscore, "evi_zscore"),
+            "ndmi_zscore_6mo": safe_flatten(features.ndmi_zscore, "ndmi_zscore"),
+            "bsi_zscore_6mo": safe_flatten(features.bsi_zscore, "bsi_zscore"),
+            "ndre_zscore_6mo": safe_flatten(features.ndre_zscore, "ndre_zscore"),
+            "evi_diff_mom": safe_flatten(features.evi_diff, "evi_diff"),
+            "ndmi_diff_mom": safe_flatten(features.ndmi_diff, "ndmi_diff"),
+            "bsi_diff_mom": safe_flatten(features.bsi_diff, "bsi_diff"),
+            "ndre_diff_mom": safe_flatten(features.ndre_diff, "ndre_diff"),
+            "vv_desc": safe_flatten(features.vv_desc, "vv_desc"),
+            "vv_asc": safe_flatten(features.vv_asc, "vv_asc"),
+            "vv_desc_zscore_6mo": safe_flatten(
+                features.vv_desc_zscore, "vv_desc_zscore"
+            ),
+            "vv_asc_zscore_6mo": safe_flatten(features.vv_asc_zscore, "vv_asc_zscore"),
+            "vv_desc_diff_mom": safe_flatten(features.vv_desc_diff, "vv_desc_diff"),
+            "vv_asc_diff_mom": safe_flatten(features.vv_asc_diff, "vv_asc_diff"),
+            "vv_roughness_drop_desc": safe_flatten(
+                features.vv_roughness_drop_desc, "vv_roughness_drop_desc"
+            ),
+            "vv_roughness_drop_asc": safe_flatten(
+                features.vv_roughness_drop_asc, "vv_roughness_drop_asc"
+            ),
+            "latent_shift_yoy_1y": safe_flatten(
+                features.latent_yoy_1y, "latent_yoy_1y"
+            ),
+            "latent_shift_yoy_2y": safe_flatten(
+                features.latent_yoy_2y, "latent_yoy_2y"
+            ),
+            "gladl_alert": safe_flatten(features.gladl_alert, "gladl_alert"),
+            "glads2_alert": safe_flatten(features.glads2_alert, "glads2_alert"),
+            "radd_alert": safe_flatten(features.radd_alert, "radd_alert"),
         }
     )
 
