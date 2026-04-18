@@ -9,6 +9,9 @@ from tqdm import tqdm
 import re
 import random
 
+SEED = 42
+SAMPLE_FRACTION = 0.2
+
 
 @dataclass
 class TileData:
@@ -625,8 +628,8 @@ def get_available_tiles(
 def compute_features_pipeline(
     data_dir: Union[str, Path],
     output_path: Union[str, Path],
-    sample_fraction: float = 1.0,
-    seed: int = 42,
+    sample_fraction: float = SAMPLE_FRACTION,
+    seed: int = SEED,
     window_config: Optional[Dict[str, Any]] = None,
 ) -> pl.DataFrame:
     data_dir = Path(data_dir)
@@ -678,3 +681,8 @@ def compute_features_pipeline(
         return final_df
     else:
         return pl.DataFrame()
+
+
+if __name__ == "__main__":
+    feature_dataframe = compute_features_pipeline()
+    feature_dataframe.to_parquet("data/features.parquet")
