@@ -98,9 +98,9 @@ def compute_vv_roughness_drop(
 def compute_latent_space_shift(
     embedding_t: np.ndarray, embedding_t_minus_1: np.ndarray
 ) -> np.ndarray:
-    dot = np.sum(embedding_t * embedding_t_minus_1, axis=-1)
-    norm_t = np.linalg.norm(embedding_t, axis=-1)
-    norm_t1 = np.linalg.norm(embedding_t_minus_1, axis=-1)
+    dot = np.sum(embedding_t * embedding_t_minus_1, axis=0)
+    norm_t = np.linalg.norm(embedding_t, axis=0)
+    norm_t1 = np.linalg.norm(embedding_t_minus_1, axis=0)
     denom = norm_t * norm_t1
     cosine_sim = np.where(denom != 0, dot / denom, 0.0)
     return 1.0 - cosine_sim
@@ -229,7 +229,7 @@ def parse_aef_filename(filename: str) -> Tuple[str, int]:
 
 
 def parse_s2_filename(filename: str) -> Tuple[str, int, int]:
-    match = re.match(r"^([A-Z0-9]+_\d+_\d+)_s2_l2a_(\d{4})_(\d{1,2})\.tif$", filename)
+    match = re.match(r"^([A-Z0-9]+_\d+_\d+)__s2_l2a_(\d{4})_(\d{1,2})\.tif$", filename)
     if match:
         return match.group(1), int(match.group(2)), int(match.group(3))
     return None, None, None
@@ -237,7 +237,7 @@ def parse_s2_filename(filename: str) -> Tuple[str, int, int]:
 
 def parse_s1_filename(filename: str) -> Tuple[str, int, int, str]:
     match = re.match(
-        r"^([A-Z0-9]+_\d+_\d+)_s1_rtc_(\d{4})_(\d{1,2})_(ascending|descending)\.tif$",
+        r"^([A-Z0-9]+_\d+_\d+)__s1_rtc_(\d{4})_(\d{1,2})_(ascending|descending)\.tif$",
         filename,
     )
     if match:
@@ -247,10 +247,12 @@ def parse_s1_filename(filename: str) -> Tuple[str, int, int, str]:
 
 def parse_label_filename(filename: str) -> Tuple[str, str, int]:
     match = re.match(
-        r"^(gladl|glads2|radd)_([A-Z0-9]+_\d+_\d+)_alert(\d{2})\.tif$", filename
+        r"^(gladl|glads2|radd)_([A-Z0-9]+_\d+_\d+)_(?:alert|labels|alertDate)(\d{2})?\.tif$",
+        filename,
     )
     if match:
-        return match.group(2), match.group(1), int(match.group(3))
+        year = int(match.group(3)) if match.group(3) else None
+        return match.group(2), match.group(1), year
     return None, None, None
 
 
@@ -311,24 +313,73 @@ def load_tile(
                     s1_data[(year, month, orbit)] = upsampled
 
     aef_data = {}
-    for year in range(2020, 2026):
-        f = aef_dir / f"{tile_id}_{year}.tiff"
-        if f.exists():
-            with rasterio.open(f) as src:
-                arr = src.read().astype(np.float32)
-                aef_data[year] = arr
+    aef_dir = data_dir / "aef-embeddings" / split
+    if reference_transform is not None:
+        for year in range(2020, 2026):
+            f = aef_dir / f"{tile_id}_{year}.tiff"
+            if f.exists():
+                with rasterio.open(f) as src:
+                    arr = src.read().astype(np.float32)
+                    if src.shape != reference_shape:
+                        resampled = np.empty(
+                            (arr.shape[0], *reference_shape), dtype=np.float32
+                        )
+                        for band_idx in range(arr.shape[0]):
+                            reproject(
+                                source=arr[band_idx],
+                                destination=resampled[band_idx],
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=reference_transform,
+                                dst_crs=reference_crs,
+                                resampling=Resampling.bilinear,
+                                nodata=np.nan,
+                            )
+                        aef_data[year] = resampled
+                    else:
+                        aef_data[year] = arr
 
     labels = {}
-    if split == "train":
-        for label_system in ["gladl", "glads2", "radd"]:
-            label_dir = labels_base_dir / label_system
-            label_data = {}
-            for year in range(2021, 2026):
-                f = label_dir / f"{label_system}_{tile_id}_alert{str(year)[-2:]}.tif"
-                if f.exists():
-                    with rasterio.open(f) as src:
-                        label_data[year] = src.read(1).astype(np.float32)
-            labels[label_system] = label_data
+    if split == "train" and reference_transform is not None:
+
+        def _load_label(path, is_yearly=True):
+            if not path.exists():
+                return {}
+            with rasterio.open(path) as src:
+                arr = src.read(1).astype(np.float32)
+                if src.shape != reference_shape:
+                    resampled = nan_array(reference_shape)
+                    reproject(
+                        source=arr,
+                        destination=resampled,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=reference_transform,
+                        dst_crs=reference_crs,
+                        resampling=Resampling.nearest,
+                    )
+                    arr = resampled
+                if is_yearly:
+                    m = re.search(r"alert(\d{2})\.tif$", path.name)
+                    if m:
+                        year = 2000 + int(m.group(1))
+                        return {year: arr}
+                    return {}
+                return {y: arr for y in range(2021, 2026)}
+
+        label_dir = labels_base_dir / "gladl"
+        label_data = {}
+        for yy in range(21, 26):
+            f = label_dir / f"gladl_{tile_id}_alert{yy}.tif"
+            if f.exists():
+                label_data.update(_load_label(f, is_yearly=True))
+        labels["gladl"] = label_data
+
+        f = labels_base_dir / "glads2" / f"glads2_{tile_id}_alert.tif"
+        labels["glads2"] = _load_label(f, is_yearly=False)
+
+        f = labels_base_dir / "radd" / f"radd_{tile_id}_labels.tif"
+        labels["radd"] = _load_label(f, is_yearly=False)
 
     return TileData(
         tile_id=tile_id,
