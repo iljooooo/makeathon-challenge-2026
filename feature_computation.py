@@ -10,7 +10,12 @@ import re
 import random
 
 SEED = 42
-SAMPLE_FRACTION = 0.2
+SAMPLE_FRACTION = 1
+S2_BANDS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
+
+
+def nan_array(shape: Tuple[int, int]) -> np.ndarray:
+    return np.full(shape, np.nan, dtype=np.float32)
 
 
 @dataclass
@@ -155,27 +160,19 @@ def compute_optical_temporal_features(
     min_observations: int = 3,
 ) -> Dict[str, np.ndarray]:
     features = {}
-
     for idx_name in ["evi", "ndmi", "bsi", "ndre"]:
         current = current_indices[idx_name]
         hist_stack = historical_indices_stack.get(idx_name)
-
-        if hist_stack is not None and len(hist_stack) >= min_observations:
-            features[f"{idx_name}_zscore"] = compute_zscore_anomaly(current, hist_stack)
-        else:
-            features[f"{idx_name}_zscore"] = np.full_like(
-                current, np.nan, dtype=np.float32
-            )
-
-        if previous_indices is not None and idx_name in previous_indices:
-            features[f"{idx_name}_diff"] = compute_first_order_difference(
-                current, previous_indices[idx_name]
-            )
-        else:
-            features[f"{idx_name}_diff"] = np.full_like(
-                current, np.nan, dtype=np.float32
-            )
-
+        features[f"{idx_name}_zscore"] = (
+            compute_zscore_anomaly(current, hist_stack)
+            if hist_stack is not None and len(hist_stack) >= min_observations
+            else nan_array(current.shape)
+        )
+        features[f"{idx_name}_diff"] = (
+            compute_first_order_difference(current, previous_indices[idx_name])
+            if previous_indices and idx_name in previous_indices
+            else nan_array(current.shape)
+        )
     return features
 
 
@@ -185,25 +182,22 @@ def compute_radar_features(
     previous_vv: Optional[np.ndarray] = None,
     min_observations: int = 3,
 ) -> Dict[str, np.ndarray]:
-    features = {}
-
+    shape = current_vv.shape
+    feats = {}
     if historical_vv_stack is not None and len(historical_vv_stack) >= min_observations:
-        features["vv_zscore"] = compute_zscore_anomaly(current_vv, historical_vv_stack)
-        features["vv_roughness_drop"] = compute_vv_roughness_drop(
+        feats["vv_zscore"] = compute_zscore_anomaly(current_vv, historical_vv_stack)
+        feats["vv_roughness_drop"] = compute_vv_roughness_drop(
             current_vv, historical_vv_stack
         )
     else:
-        features["vv_zscore"] = np.full_like(current_vv, np.nan, dtype=np.float32)
-        features["vv_roughness_drop"] = np.full_like(
-            current_vv, np.nan, dtype=np.float32
-        )
-
-    if previous_vv is not None:
-        features["vv_diff"] = compute_first_order_difference(current_vv, previous_vv)
-    else:
-        features["vv_diff"] = np.full_like(current_vv, np.nan, dtype=np.float32)
-
-    return features
+        feats["vv_zscore"] = nan_array(shape)
+        feats["vv_roughness_drop"] = nan_array(shape)
+    feats["vv_diff"] = (
+        compute_first_order_difference(current_vv, previous_vv)
+        if previous_vv is not None
+        else nan_array(shape)
+    )
+    return feats
 
 
 def compute_latent_features(
@@ -211,27 +205,15 @@ def compute_latent_features(
     embedding_t_minus_1: Optional[np.ndarray] = None,
     embedding_t_minus_2: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
-    features = {}
-
-    if embedding_t_minus_1 is not None:
-        features["latent_shift_1y"] = compute_latent_space_shift(
-            embedding_t, embedding_t_minus_1
-        )
-    else:
-        features["latent_shift_1y"] = np.full(
-            embedding_t.shape[1:], np.nan, dtype=np.float32
-        )
-
-    if embedding_t_minus_2 is not None:
-        features["latent_shift_2y"] = compute_latent_space_shift(
-            embedding_t, embedding_t_minus_2
-        )
-    else:
-        features["latent_shift_2y"] = np.full(
-            embedding_t.shape[1:], np.nan, dtype=np.float32
-        )
-
-    return features
+    shape = embedding_t.shape[1:]
+    return {
+        "latent_shift_1y": compute_latent_space_shift(embedding_t, embedding_t_minus_1)
+        if embedding_t_minus_1 is not None
+        else nan_array(shape),
+        "latent_shift_2y": compute_latent_space_shift(embedding_t, embedding_t_minus_2)
+        if embedding_t_minus_2 is not None
+        else nan_array(shape),
+    }
 
 
 def parse_tile_id(folder_name: str) -> str:
@@ -299,22 +281,11 @@ def load_tile(
             _, year, month = parsed
             with rasterio.open(f) as src:
                 arr = src.read().astype(np.float32)
-                s2_data[(year, month)] = {
-                    "B02": arr[1],
-                    "B03": arr[2],
-                    "B04": arr[3],
-                    "B05": arr[4],
-                    "B06": arr[5],
-                    "B07": arr[6],
-                    "B08": arr[7],
-                    "B8A": arr[8],
-                    "B09": arr[9],
-                    "B11": arr[10],
-                    "B12": arr[11],
-                    "transform": src.transform,
-                    "crs": src.crs,
-                    "shape": src.shape,
-                }
+                bands = {name: arr[i] for i, name in enumerate(S2_BANDS, start=1)}
+                bands.update(
+                    {"transform": src.transform, "crs": src.crs, "shape": src.shape}
+                )
+                s2_data[(year, month)] = bands
                 if reference_transform is None:
                     reference_transform = src.transform
                     reference_crs = src.crs
@@ -402,19 +373,84 @@ def get_previous_timestep(
     return None
 
 
+def _build_historical_indices_stack(
+    tile_data: TileData,
+    historical_months: List[Tuple[int, int]],
+    index_names: List[str],
+    min_obs: int,
+) -> Dict[str, np.ndarray]:
+    stack = {idx: [] for idx in index_names}
+    for hy, hm in historical_months:
+        if (hy, hm) in tile_data.s2_data:
+            indices = compute_optical_indices(tile_data.s2_data[(hy, hm)])
+            for idx_name in index_names:
+                stack[idx_name].append(indices[idx_name])
+    return {idx: np.stack(vals) for idx, vals in stack.items() if len(vals) >= min_obs}
+
+
+def _build_radar_features_for_orbit(
+    tile_data: TileData,
+    year: int,
+    month: int,
+    orbit: str,
+    historical_months: List[Tuple[int, int]],
+    prev_month: Optional[Tuple[int, int]],
+    min_obs: int,
+    reference_shape: Tuple[int, int],
+) -> Dict[str, np.ndarray]:
+    current_vv = tile_data.s1_data.get((year, month, orbit), nan_array(reference_shape))
+    hist_stack = [
+        tile_data.s1_data[(hy, hm, orbit)]
+        for hy, hm in historical_months
+        if (hy, hm, orbit) in tile_data.s1_data
+    ]
+    hist_stack = np.stack(hist_stack) if len(hist_stack) >= min_obs else None
+    prev_vv = tile_data.s1_data.get((*prev_month, orbit)) if prev_month else None
+    feats = compute_radar_features(current_vv, hist_stack, prev_vv, min_obs)
+    feats["vv_current"] = current_vv
+    return feats
+
+
+def _build_label_features(
+    tile_data: TileData, year: int, reference_shape: Tuple[int, int]
+) -> Dict[str, np.ndarray]:
+    labels = {}
+    for system in ["gladl", "glads2", "radd"]:
+        if system in tile_data.labels and year in tile_data.labels[system]:
+            labels[f"{system}_alert"] = tile_data.labels[system][year]
+        else:
+            labels[f"{system}_alert"] = nan_array(reference_shape)
+    return labels
+
+
+def _build_latent_features(
+    tile_data: TileData, year: int, reference_shape: Tuple[int, int]
+) -> Dict[str, np.ndarray]:
+    if year not in tile_data.aef_data:
+        return {
+            "latent_shift_1y": nan_array(reference_shape),
+            "latent_shift_2y": nan_array(reference_shape),
+        }
+    feats = compute_latent_features(
+        tile_data.aef_data[year],
+        tile_data.aef_data.get(year - 1),
+        tile_data.aef_data.get(year - 2),
+    )
+    return {
+        "latent_shift_1y": feats["latent_shift_1y"],
+        "latent_shift_2y": feats["latent_shift_2y"],
+    }
+
+
 def compute_timestep_features(
     tile_data: TileData,
     year: int,
     month: int,
     window_config: Optional[Dict[str, Any]] = None,
 ) -> TileFeatures:
-    if window_config is None:
-        window_config = {"lookback_months": 6, "min_observations": 3}
-
-    lookback = window_config["lookback_months"]
-    min_obs = window_config["min_observations"]
-    reference_shape = tile_data.reference_shape
-
+    cfg = window_config or {"lookback_months": 6, "min_observations": 3}
+    lookback, min_obs = cfg["lookback_months"], cfg["min_observations"]
+    ref_shape = tile_data.reference_shape
     all_timesteps = sorted(tile_data.s2_data.keys())
 
     s2_month = tile_data.s2_data.get((year, month))
@@ -424,94 +460,40 @@ def compute_timestep_features(
         )
 
     current_indices = compute_optical_indices(s2_month)
-
     historical_months = get_historical_timesteps(all_timesteps, year, month, lookback)
-    historical_indices_stack = {}
-    for idx_name in ["evi", "ndmi", "bsi", "ndre"]:
-        stack = []
-        for hy, hm in historical_months:
-            if (hy, hm) in tile_data.s2_data:
-                hist_bands = tile_data.s2_data[(hy, hm)]
-                hist_indices = compute_optical_indices(hist_bands)
-                stack.append(hist_indices[idx_name])
-        if stack:
-            historical_indices_stack[idx_name] = np.stack(stack)
-
-    prev_month = get_previous_timestep(all_timesteps, year, month)
-    previous_indices = None
-    if prev_month and prev_month in tile_data.s2_data:
-        previous_indices = compute_optical_indices(tile_data.s2_data[prev_month])
-
-    optical_temporal = compute_optical_temporal_features(
-        current_indices,
-        historical_indices_stack,
-        previous_indices,
-        min_observations=min_obs,
+    hist_stack = _build_historical_indices_stack(
+        tile_data, historical_months, ["evi", "ndmi", "bsi", "ndre"], min_obs
     )
 
-    vv_desc = np.full(reference_shape, np.nan, dtype=np.float32)
-    vv_asc = np.full(reference_shape, np.nan, dtype=np.float32)
-    vv_desc_features = {}
-    vv_asc_features = {}
+    prev_month = get_previous_timestep(all_timesteps, year, month)
+    prev_indices = (
+        compute_optical_indices(tile_data.s2_data[prev_month])
+        if prev_month and prev_month in tile_data.s2_data
+        else None
+    )
+    optical_temporal = compute_optical_temporal_features(
+        current_indices, hist_stack, prev_indices, min_obs
+    )
 
-    if tile_data.s1_data:
-        if (year, month, "descending") in tile_data.s1_data:
-            vv_desc = tile_data.s1_data[(year, month, "descending")]
-        if (year, month, "ascending") in tile_data.s1_data:
-            vv_asc = tile_data.s1_data[(year, month, "ascending")]
-
-        s1_hist_desc = []
-        s1_hist_asc = []
-        for hy, hm in historical_months:
-            if (hy, hm, "descending") in tile_data.s1_data:
-                s1_hist_desc.append(tile_data.s1_data[(hy, hm, "descending")])
-            if (hy, hm, "ascending") in tile_data.s1_data:
-                s1_hist_asc.append(tile_data.s1_data[(hy, hm, "ascending")])
-
-        s1_hist_desc_stack = np.stack(s1_hist_desc) if s1_hist_desc else None
-        s1_hist_asc_stack = np.stack(s1_hist_asc) if s1_hist_asc else None
-
-        prev_vv_desc = None
-        prev_vv_asc = None
-        if prev_month:
-            prev_y, prev_m = prev_month
-            if (prev_y, prev_m, "descending") in tile_data.s1_data:
-                prev_vv_desc = tile_data.s1_data[(prev_y, prev_m, "descending")]
-            if (prev_y, prev_m, "ascending") in tile_data.s1_data:
-                prev_vv_asc = tile_data.s1_data[(prev_y, prev_m, "ascending")]
-
-        vv_desc_features = compute_radar_features(
-            vv_desc, s1_hist_desc_stack, prev_vv_desc, min_observations=min_obs
-        )
-        vv_asc_features = compute_radar_features(
-            vv_asc, s1_hist_asc_stack, prev_vv_asc, min_observations=min_obs
+    vv_features = {}
+    for orbit in ["descending", "ascending"]:
+        vv_features[orbit] = _build_radar_features_for_orbit(
+            tile_data,
+            year,
+            month,
+            orbit,
+            historical_months,
+            prev_month,
+            min_obs,
+            ref_shape,
         )
 
-    latent_yoy_1y = np.full(reference_shape, np.nan, dtype=np.float32)
-    latent_yoy_2y = np.full(reference_shape, np.nan, dtype=np.float32)
-
-    if tile_data.aef_data:
-        if year in tile_data.aef_data:
-            embedding_t = tile_data.aef_data[year]
-            embedding_t1 = tile_data.aef_data.get(year - 1)
-            embedding_t2 = tile_data.aef_data.get(year - 2)
-            latent_features = compute_latent_features(
-                embedding_t, embedding_t1, embedding_t2
-            )
-            latent_yoy_1y = latent_features["latent_shift_1y"]
-            latent_yoy_2y = latent_features["latent_shift_2y"]
-
-    gladl_alert = np.full(reference_shape, np.nan, dtype=np.float32)
-    glads2_alert = np.full(reference_shape, np.nan, dtype=np.float32)
-    radd_alert = np.full(reference_shape, np.nan, dtype=np.float32)
-
-    if tile_data.split == "train" and tile_data.labels:
-        if "gladl" in tile_data.labels and year in tile_data.labels["gladl"]:
-            gladl_alert = tile_data.labels["gladl"][year]
-        if "glads2" in tile_data.labels and year in tile_data.labels["glads2"]:
-            glads2_alert = tile_data.labels["glads2"][year]
-        if "radd" in tile_data.labels and year in tile_data.labels["radd"]:
-            radd_alert = tile_data.labels["radd"][year]
+    latent = _build_latent_features(tile_data, year, ref_shape)
+    labels = (
+        _build_label_features(tile_data, year, ref_shape)
+        if tile_data.split == "train"
+        else {f"{s}_alert": nan_array(ref_shape) for s in ["gladl", "glads2", "radd"]}
+    )
 
     return TileFeatures(
         tile_id=tile_data.tile_id,
@@ -530,31 +512,23 @@ def compute_timestep_features(
         ndmi_diff=optical_temporal["ndmi_diff"],
         bsi_diff=optical_temporal["bsi_diff"],
         ndre_diff=optical_temporal["ndre_diff"],
-        vv_desc=vv_desc,
-        vv_asc=vv_asc,
-        vv_desc_zscore=vv_desc_features.get(
-            "vv_zscore", np.full(reference_shape, np.nan, dtype=np.float32)
+        vv_desc=vv_features["descending"].get("vv_current", nan_array(ref_shape)),
+        vv_asc=vv_features["ascending"].get("vv_current", nan_array(ref_shape)),
+        vv_desc_zscore=vv_features["descending"].get("vv_zscore", nan_array(ref_shape)),
+        vv_asc_zscore=vv_features["ascending"].get("vv_zscore", nan_array(ref_shape)),
+        vv_desc_diff=vv_features["descending"].get("vv_diff", nan_array(ref_shape)),
+        vv_asc_diff=vv_features["ascending"].get("vv_diff", nan_array(ref_shape)),
+        vv_roughness_drop_desc=vv_features["descending"].get(
+            "vv_roughness_drop", nan_array(ref_shape)
         ),
-        vv_asc_zscore=vv_asc_features.get(
-            "vv_zscore", np.full(reference_shape, np.nan, dtype=np.float32)
+        vv_roughness_drop_asc=vv_features["ascending"].get(
+            "vv_roughness_drop", nan_array(ref_shape)
         ),
-        vv_desc_diff=vv_desc_features.get(
-            "vv_diff", np.full(reference_shape, np.nan, dtype=np.float32)
-        ),
-        vv_asc_diff=vv_asc_features.get(
-            "vv_diff", np.full(reference_shape, np.nan, dtype=np.float32)
-        ),
-        vv_roughness_drop_desc=vv_desc_features.get(
-            "vv_roughness_drop", np.full(reference_shape, np.nan, dtype=np.float32)
-        ),
-        vv_roughness_drop_asc=vv_asc_features.get(
-            "vv_roughness_drop", np.full(reference_shape, np.nan, dtype=np.float32)
-        ),
-        latent_yoy_1y=latent_yoy_1y,
-        latent_yoy_2y=latent_yoy_2y,
-        gladl_alert=gladl_alert,
-        glads2_alert=glads2_alert,
-        radd_alert=radd_alert,
+        latent_yoy_1y=latent["latent_shift_1y"],
+        latent_yoy_2y=latent["latent_shift_2y"],
+        gladl_alert=labels["gladl_alert"],
+        glads2_alert=labels["glads2_alert"],
+        radd_alert=labels["radd_alert"],
     )
 
 
@@ -626,12 +600,19 @@ def get_available_tiles(
 
 
 def compute_features_pipeline(
-    data_dir: Union[str, Path],
-    output_path: Union[str, Path],
+    data_dir: Union[str, Path] = None,
+    output_path: Union[str, Path] = None,
     sample_fraction: float = SAMPLE_FRACTION,
     seed: int = SEED,
     window_config: Optional[Dict[str, Any]] = None,
 ) -> pl.DataFrame:
+    if data_dir is None:
+        data_dir = Path(__file__).parent / "data" / "makeathon-challenge"
+        print(f"Using default data directory: {data_dir}")
+    if output_path is None:
+        output_path = Path(__file__).parent / "features.parquet"
+        print(f"Using default output path: {output_path}")
+
     data_dir = Path(data_dir)
     output_path = Path(output_path)
 
@@ -685,4 +666,6 @@ def compute_features_pipeline(
 
 if __name__ == "__main__":
     feature_dataframe = compute_features_pipeline()
-    feature_dataframe.to_parquet("data/features.parquet")
+    print(f"Generated {len(feature_dataframe)} rows")
+    print(f"Columns: {feature_dataframe.columns}")
+    print(f"Shape: {feature_dataframe.shape}")
