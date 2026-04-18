@@ -740,20 +740,22 @@ def get_available_tiles(
 
 def compute_features_pipeline(
     data_dir: Union[str, Path] = None,
-    output_path: Union[str, Path] = None,
+    output_dir: Union[str, Path] = None,
     sample_fraction: float = SAMPLE_FRACTION,
     seed: int = SEED,
     window_config: Optional[Dict[str, Any]] = None,
-) -> pl.DataFrame:
+    skip_existing: bool = True,
+) -> Dict[str, Path]:
     if data_dir is None:
         data_dir = Path(__file__).parent / "data" / "makeathon-challenge"
         print(f"Using default data directory: {data_dir}")
-    if output_path is None:
-        output_path = Path(__file__).parent / "features.parquet"
-        print(f"Using default output path: {output_path}")
+    if output_dir is None:
+        output_dir = Path(__file__).parent / "data" / "parquet"
+        print(f"Using default output directory: {output_dir}")
 
     data_dir = Path(data_dir)
-    output_path = Path(output_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if window_config is None:
         window_config = {"lookback_months": 6, "min_observations": 3}
@@ -770,15 +772,25 @@ def compute_features_pipeline(
         n_tiles = max(1, int(len(all_tiles) * sample_fraction))
         all_tiles = all_tiles[:n_tiles]
 
-    all_rows = []
+    output_paths = {}
 
     for tile_id, split in tqdm(all_tiles, desc="Processing tiles"):
+        tile_parquet_path = output_dir / f"{tile_id}.parquet"
+
+        if skip_existing and tile_parquet_path.exists():
+            print(f"  [SKIP] {tile_id} already exists")
+            output_paths[tile_id] = tile_parquet_path
+            continue
+
         tile_data = load_tile(data_dir, tile_id, split)
         if not tile_data.s2_data:
+            print(f"  [WARN] {tile_id}: no S2 data")
             continue
 
         timesteps = sorted(tile_data.s2_data.keys())
         years = sorted(set(y for y, m in timesteps))
+
+        tile_rows = []
 
         for year in years:
             months = sorted([m for y, m in timesteps if y == year])
@@ -792,19 +804,22 @@ def compute_features_pipeline(
                 tile_df = tile_features_to_dataframe(features)
                 if tile_df.height > 0:
                     tile_df = tile_df.with_columns(pl.lit(split).alias("split"))
-                    all_rows.append(tile_df)
+                    tile_rows.append(tile_df)
 
-    if all_rows:
-        final_df = pl.concat(all_rows)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        final_df.write_parquet(output_path)
-        return final_df
-    else:
-        return pl.DataFrame()
+        if tile_rows:
+            tile_final = pl.concat(tile_rows)
+            tile_final.write_parquet(tile_parquet_path)
+            output_paths[tile_id] = tile_parquet_path
+            print(f"  {tile_id}: {tile_final.height:,} rows -> {tile_parquet_path}")
+
+            del tile_rows
+            del tile_final
+
+    return output_paths
 
 
 if __name__ == "__main__":
-    feature_dataframe = compute_features_pipeline()
-    print(f"Generated {len(feature_dataframe)} rows")
-    print(f"Columns: {feature_dataframe.columns}")
-    print(f"Shape: {feature_dataframe.shape}")
+    output_paths = compute_features_pipeline()
+    print(f"\nGenerated {len(output_paths)} tile parquet files")
+    for tile_id, path in sorted(output_paths.items()):
+        print(f"  {tile_id}: {path}")

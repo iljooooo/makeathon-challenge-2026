@@ -116,80 +116,68 @@ def fetch_hansen_via_ee(
     if not EE_AVAILABLE:
         raise RuntimeError("earthengine-api required for Hansen download")
 
-    hansen = ee.Image(HANSEN_ASSET)
-    region = ee.Geometry.Rectangle(bounds_wgs84, proj="EPSG:4326")
+    import requests
+    from rasterio.io import MemoryFile
 
-    treecover = hansen.select("treecover2000").clip(region)
-    lossyear = hansen.select("lossyear").clip(region)
+    hansen = ee.Image(HANSEN_ASSET).unmask(0)
 
-    def _download_band(image, band_name, ref_transform, ref_crs, ref_shape, scale):
-        from pyproj import Transformer
+    region_geojson = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [bounds_wgs84[0], bounds_wgs84[1]],
+                [bounds_wgs84[2], bounds_wgs84[1]],
+                [bounds_wgs84[2], bounds_wgs84[3]],
+                [bounds_wgs84[0], bounds_wgs84[3]],
+                [bounds_wgs84[0], bounds_wgs84[1]],
+            ]
+        ],
+    }
 
-        height, width = ref_shape
-        bounds_pixel = [
-            ref_transform * (0, 0),
-            ref_transform * (width, 0),
-            ref_transform * (width, height),
-            ref_transform * (0, height),
-        ]
+    both_bands = hansen.select(["treecover2000", "lossyear"])
 
-        transformer = Transformer.from_crs(ref_crs, CRS.from_epsg(4326), always_xy=True)
-        bounds_wgs = [transformer.transform(x, y) for x, y in bounds_pixel]
-        lons = [b[0] for b in bounds_wgs]
-        lats = [b[1] for b in bounds_wgs]
+    for attempt in range(max_attempts):
+        try:
+            url = both_bands.getDownloadURL(
+                params={
+                    "region": region_geojson,
+                    "scale": scale,
+                    "crs": "EPSG:4326",
+                    "format": "GEO_TIFF",
+                }
+            )
+            response = requests.get(url, timeout=300)
+            response.raise_for_status()
 
-        region_ee = ee.Geometry.Rectangle(
-            [min(lons), min(lats), max(lons), max(lats)],
-            proj="EPSG:4326",
-        )
+            with MemoryFile(response.content) as memfile:
+                with memfile.open() as src:
+                    tree_arr = src.read(1).astype(np.float32)
+                    loss_arr = src.read(2).astype(np.int32)
+                    src_transform = src.transform
+                    src_crs = src.crs
+            break
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                print(f"[WARN] Attempt {attempt + 1} failed: {e}")
+                import time
 
-        clipped = image.clip(region_ee)
+                time.sleep(10)
+            else:
+                raise
 
-        for attempt in range(max_attempts):
-            try:
-                data = clipped.sampleRectangle(
-                    region=region_ee,
-                    scale=scale,
-                ).getInfo()
+    import gc
 
-                arr = np.array(data["properties"][band_name], dtype=np.float32)
-                return arr.T
-            except Exception as e:
-                if attempt < max_attempts - 1:
-                    print(f"[WARN] Attempt {attempt + 1} failed for {band_name}: {e}")
-                    import time
-
-                    time.sleep(2)
-                else:
-                    raise
-
-    tree_arr = _download_band(
-        treecover, "treecover2000", ref_transform, ref_crs, ref_shape, scale
-    )
-    loss_arr = _download_band(
-        lossyear, "lossyear", ref_transform, ref_crs, ref_shape, scale
-    )
+    gc.collect()
 
     target_shape = ref_shape
     tree_resampled = np.empty(target_shape, dtype=np.float32)
     loss_resampled = np.empty(target_shape, dtype=np.int32)
 
-    from rasterio.transform import from_bounds
-
-    hansen_transform = from_bounds(
-        bounds_wgs84[0],
-        bounds_wgs84[1],
-        bounds_wgs84[2],
-        bounds_wgs84[3],
-        tree_arr.shape[1],
-        tree_arr.shape[0],
-    )
-
     reproject(
         source=tree_arr,
         destination=tree_resampled,
-        src_transform=hansen_transform,
-        src_crs=CRS.from_epsg(4326),
+        src_transform=src_transform,
+        src_crs=src_crs,
         dst_transform=ref_transform,
         dst_crs=ref_crs,
         resampling=Resampling.bilinear,
@@ -200,8 +188,8 @@ def fetch_hansen_via_ee(
     reproject(
         source=loss_arr,
         destination=loss_resampled,
-        src_transform=hansen_transform,
-        src_crs=CRS.from_epsg(4326),
+        src_transform=src_transform,
+        src_crs=src_crs,
         dst_transform=ref_transform,
         dst_crs=ref_crs,
         resampling=Resampling.nearest,
@@ -361,82 +349,56 @@ def compute_temporal_target(
     return target
 
 
-def merge_hansen_into_features(
-    features_parquet: Path,
+def merge_single_tile_parquet(
+    tile_parquet_path: Path,
     baseline_dir: Path,
-    output_parquet: Path,
-    batch_size: int = 1_000_000,
-) -> pl.DataFrame:
-    print(f"[INFO] Loading features from {features_parquet}")
-    df = pl.read_parquet(features_parquet)
+    output_dir: Path,
+) -> Optional[Path]:
+    tile_id = tile_parquet_path.stem
 
-    tile_ids = df.select("tile_id").unique().to_series().to_list()
+    tree_path = baseline_dir / f"{tile_id}_treecover2000.tif"
+    loss_path = baseline_dir / f"{tile_id}_lossyear.tif"
+    forest_path = baseline_dir / f"{tile_id}_forest_2020.tif"
 
-    hansen_cache = {}
-    print(f"[INFO] Loading Hansen data for {len(tile_ids)} tiles")
-    for tile_id in tile_ids:
-        tree_path = baseline_dir / f"{tile_id}_treecover2000.tif"
-        loss_path = baseline_dir / f"{tile_id}_lossyear.tif"
-        forest_path = baseline_dir / f"{tile_id}_forest_2020.tif"
+    if not (tree_path.exists() and loss_path.exists() and forest_path.exists()):
+        print(f"  [WARN] {tile_id}: Hansen baseline data not found")
+        return None
 
-        if tree_path.exists() and loss_path.exists() and forest_path.exists():
-            with rasterio.open(tree_path) as src:
-                treecover2000 = src.read(1).astype(np.float32)
-            with rasterio.open(loss_path) as src:
-                lossyear = src.read(1).astype(np.int32)
-            with rasterio.open(forest_path) as src:
-                forest_2020 = src.read(1).astype(np.uint8)
+    with rasterio.open(tree_path) as src:
+        treecover2000 = src.read(1).astype(np.float32)
+    with rasterio.open(loss_path) as src:
+        lossyear = src.read(1).astype(np.int32)
+    with rasterio.open(forest_path) as src:
+        forest_2020 = src.read(1).astype(np.uint8)
 
-            hansen_cache[tile_id] = {
-                "treecover2000": treecover2000,
-                "lossyear": lossyear,
-                "forest_2020": forest_2020,
-            }
-        else:
-            print(f"[WARN] Hansen data missing for {tile_id}")
+    print(f"  {tile_id}: Loading parquet...")
+    df = pl.read_parquet(tile_parquet_path)
 
-    print(f"[INFO] Computing temporal targets and merging")
+    if df.height == 0:
+        print(f"  [WARN] {tile_id}: empty parquet")
+        return None
+
+    unique_years = df.select("year").unique().to_series().to_list()
 
     result_dfs = []
-    unique_tile_year_months = df.select(["tile_id", "year", "month"]).unique()
-
-    for row in unique_tile_year_months.iter_rows():
-        tile_id, year, month = row
-
-        if tile_id not in hansen_cache:
+    for year in unique_years:
+        year_df = df.filter(pl.col("year") == year)
+        if year_df.height == 0:
             continue
-
-        hansen = hansen_cache[tile_id]
-
-        tile_month_df = df.filter(
-            (pl.col("tile_id") == tile_id)
-            & (pl.col("year") == year)
-            & (pl.col("month") == month)
-        )
-
-        if tile_month_df.height == 0:
-            continue
-
-        treecover2000 = hansen["treecover2000"]
-        lossyear = hansen["lossyear"]
-        forest_2020 = hansen["forest_2020"]
 
         target = compute_temporal_target(lossyear, year, forest_2020)
         forest_2020_mask = forest_2020.astype(np.float32)
         treecover2000_norm = treecover2000 / 100.0
 
-        height, width = target.shape
-        n_pixels = tile_month_df.height
-
-        pixel_x = tile_month_df.select("pixel_x").to_series().to_numpy()
-        pixel_y = tile_month_df.select("pixel_y").to_series().to_numpy()
+        pixel_x = year_df.select("pixel_x").to_series().to_numpy()
+        pixel_y = year_df.select("pixel_y").to_series().to_numpy()
 
         target_flat = target[pixel_y, pixel_x]
         forest_flat = forest_2020_mask[pixel_y, pixel_x]
         treecover_flat = treecover2000_norm[pixel_y, pixel_x]
         lossyear_flat = lossyear[pixel_y, pixel_x].astype(np.float32)
 
-        tile_month_df = tile_month_df.with_columns(
+        year_df = year_df.with_columns(
             [
                 pl.Series("deforestation_target", target_flat, dtype=pl.Float32),
                 pl.Series("forest_2020", forest_flat, dtype=pl.Float32),
@@ -444,19 +406,55 @@ def merge_hansen_into_features(
                 pl.Series("lossyear_hansen", lossyear_flat, dtype=pl.Float32),
             ]
         )
-
-        result_dfs.append(tile_month_df)
+        result_dfs.append(year_df)
 
     if result_dfs:
         result_df = pl.concat(result_dfs)
-        output_parquet = Path(output_parquet)
-        output_parquet.parent.mkdir(parents=True, exist_ok=True)
-        result_df.write_parquet(output_parquet)
-        print(f"[INFO] Saved merged data to {output_parquet}")
-        return result_df
-    else:
-        print("[WARN] No data to merge")
-        return df
+        output_path = output_dir / f"{tile_id}.parquet"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result_df.write_parquet(output_path)
+        print(f"  {tile_id}: {result_df.height:,} rows -> {output_path}")
+
+        del df, result_df, result_dfs
+        del treecover2000, lossyear, forest_2020
+        import gc
+
+        gc.collect()
+
+        return output_path
+
+    return None
+
+
+def merge_all_tile_parquets(
+    parquet_dir: Path,
+    baseline_dir: Path,
+    output_dir: Path,
+    skip_existing: bool = True,
+) -> Dict[str, Path]:
+    parquet_dir = Path(parquet_dir)
+    baseline_dir = Path(baseline_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tile_parquets = sorted(parquet_dir.glob("*.parquet"))
+    print(f"[INFO] Found {len(tile_parquets)} tile parquet files")
+
+    output_paths = {}
+    for tile_parquet in tile_parquets:
+        tile_id = tile_parquet.stem
+        output_path = output_dir / f"{tile_id}.parquet"
+
+        if skip_existing and output_path.exists():
+            print(f"  [SKIP] {tile_id} already merged")
+            output_paths[tile_id] = output_path
+            continue
+
+        result = merge_single_tile_parquet(tile_parquet, baseline_dir, output_dir)
+        if result:
+            output_paths[tile_id] = result
+
+    return output_paths
 
 
 def process_all_tiles(
@@ -493,30 +491,35 @@ def process_all_tiles(
                     f"forest_2020 pixels: {hansen_data.forest_2020.sum():,}"
                 )
 
+        import gc
+
+        gc.collect()
+
     return results
 
 
 def create_baseline_pipeline(
     data_dir: Path = None,
     baseline_dir: Path = None,
-    features_parquet: Path = None,
-    output_parquet: Path = None,
+    parquet_dir: Path = None,
+    output_dir: Path = None,
     project_id: Optional[str] = None,
     skip_hansen_download: bool = False,
-) -> pl.DataFrame:
+    skip_merge_existing: bool = True,
+) -> Dict[str, Path]:
     if data_dir is None:
         data_dir = Path(__file__).parent / "data" / "makeathon-challenge"
     if baseline_dir is None:
         baseline_dir = Path(__file__).parent / "data" / "baseline"
-    if features_parquet is None:
-        features_parquet = Path(__file__).parent / "features.parquet"
-    if output_parquet is None:
-        output_parquet = Path(__file__).parent / "features_with_baseline.parquet"
+    if parquet_dir is None:
+        parquet_dir = Path(__file__).parent / "data" / "parquet"
+    if output_dir is None:
+        output_dir = Path(__file__).parent / "data" / "parquet_with_baseline"
 
     data_dir = Path(data_dir)
     baseline_dir = Path(baseline_dir)
-    features_parquet = Path(features_parquet)
-    output_parquet = Path(output_parquet)
+    parquet_dir = Path(parquet_dir)
+    output_dir = Path(output_dir)
 
     if not skip_hansen_download:
         print("[INFO] Step 1: Downloading Hansen GFC data via Earth Engine")
@@ -524,26 +527,16 @@ def create_baseline_pipeline(
     else:
         print("[INFO] Step 1: Skipping Hansen download (using cached data)")
 
-    print("[INFO] Step 2: Merging Hansen data into features.parquet")
-    result = merge_hansen_into_features(features_parquet, baseline_dir, output_parquet)
+    print("[INFO] Step 2: Merging Hansen data into per-tile parquets")
+    output_paths = merge_all_tile_parquets(
+        parquet_dir, baseline_dir, output_dir, skip_existing=skip_merge_existing
+    )
 
     print(f"\n[SUMMARY]")
-    print(f"  Total rows: {result.height:,}")
-    print(f"  Columns: {len(result.columns)}")
-    print(f"  Output: {output_parquet}")
+    print(f" _tiles merged: {len(output_paths)}")
+    print(f"  Output directory: {output_dir}")
 
-    target_counts = result.filter(pl.col("deforestation_target").is_not_nan()).select(
-        [
-            pl.col("deforestation_target").sum().alias("positive"),
-            ((1 - pl.col("deforestation_target")) * pl.col("forest_2020"))
-            .sum()
-            .alias("negative"),
-        ]
-    )
-    print(f"  Positives (deforested): {target_counts['positive'][0]:,.0f}")
-    print(f"  Negatives (still forest): {target_counts['negative'][0]:,.0f}")
-
-    return result
+    return output_paths
 
 
 if __name__ == "__main__":
@@ -554,20 +547,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--baseline-dir", type=Path, help="Output directory for Hansen data"
     )
-    parser.add_argument("--features", type=Path, help="Input features.parquet path")
-    parser.add_argument("--output", type=Path, help="Output parquet path")
-    parser.add_argument("--project-id", type=str, help="GEE project ID")
+    parser.add_argument("--parquet-dir", type=Path, help="Input parquet directory")
+    parser.add_argument("--output-dir", type=Path, help="Output parquet directory")
+    parser.add_argument(
+        "-i", "--id", "--project-id", dest="project_id", type=str, help="GEE project ID"
+    )
     parser.add_argument(
         "--skip-download", action="store_true", help="Skip Hansen download"
+    )
+    parser.add_argument(
+        "--no-skip-existing", action="store_true", help="Re-merge existing tiles"
     )
 
     args = parser.parse_args()
 
-    df = create_baseline_pipeline(
+    output_paths = create_baseline_pipeline(
         data_dir=args.data_dir,
         baseline_dir=args.baseline_dir,
-        features_parquet=args.features,
-        output_parquet=args.output,
+        parquet_dir=args.parquet_dir,
+        output_dir=args.output_dir,
         project_id=args.project_id,
         skip_hansen_download=args.skip_download,
+        skip_merge_existing=not args.no_skip_existing,
     )
+
+    print(f"\nGenerated {len(output_paths)} merged parquet files")
