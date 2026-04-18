@@ -10,7 +10,7 @@ import re
 import random
 
 SEED = 42
-SAMPLE_FRACTION = 0.1
+SAMPLE_FRACTION = 1
 S2_BANDS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
 
 
