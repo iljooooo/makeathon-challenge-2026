@@ -104,7 +104,8 @@ def prepare_numpy(
     return X.astype(np.float32), y.astype(np.float32), imputer, scaler
 
 
-def train_logistic_regression(X, y, class_weights=None, max_iter=1000):
+def train_logistic_regression_batch(X, y, class_weights=None, max_iter=1000):
+    """Standard batch training - requires all data in memory."""
     from sklearn.linear_model import LogisticRegression
 
     print(f"[INFO] Training Logistic Regression on {X.shape[0]:,} samples...")
@@ -112,13 +113,91 @@ def train_logistic_regression(X, y, class_weights=None, max_iter=1000):
     model = LogisticRegression(
         max_iter=max_iter,
         class_weight=class_weights,
-        solver="lbfgs",  # lbfgs is good for small datasets
+        solver="lbfgs",
         random_state=42,
     )
     model.fit(X, y)
 
     print(f"[INFO] Done. Coefficients shape: {model.coef_.shape}")
     return model
+
+
+def train_sgd_online(processed_dir, sample_frac=1.0, max_epochs=10, class_weights=None):
+    """True online learning with SGDClassifier - processes data in batches."""
+    from sklearn.linear_model import SGDClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import StandardScaler
+
+    print(f"[INFO] Training SGDClassifier online (sample_frac={sample_frac})...")
+
+    train_dir = Path(processed_dir) / "train"
+    parquet_files = sorted(train_dir.glob("*.parquet"))
+
+    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+    scaler = StandardScaler()
+
+    classes = np.array([0, 1])
+    model = SGDClassifier(
+        loss="log_loss",
+        penalty="l2",
+        alpha=1e-4,
+        learning_rate="optimal",
+        eta0=0.01,
+        random_state=42,
+        warm_start=True,
+    )
+
+    sample_weight_val = None
+    if class_weights:
+        sample_weight_val = {0: class_weights.get(0, 1.0), 1: class_weights.get(1, 1.0)}
+
+    first_pass = True
+    for epoch in range(max_epochs):
+        print(f"[INFO] Epoch {epoch + 1}/{max_epochs}")
+
+        for pf in parquet_files:
+            df = pl.read_parquet(pf)
+            if sample_frac < 1.0:
+                df = df.sample(fraction=sample_frac, seed=42 + epoch)
+
+            X = df.select(FEATURE_COLUMNS).to_numpy()
+            y = df.select(TARGET_COLUMN).to_numpy().ravel()
+            del df
+
+            if first_pass:
+                imputer.fit(X)
+                scaler.fit(imputer.transform(X))
+                first_pass = False
+
+            X_imp = imputer.transform(X)
+            X_scaled = scaler.transform(X_imp)
+
+            weights = None
+            if sample_weight_val:
+                weights = np.where(y == 1, sample_weight_val[1], sample_weight_val[0])
+
+            if epoch == 0:
+                model.partial_fit(
+                    X_scaled.astype(np.float32),
+                    y.astype(np.int32),
+                    classes=classes,
+                    sample_weight=weights,
+                )
+            else:
+                model.partial_fit(
+                    X_scaled.astype(np.float32),
+                    y.astype(np.int32),
+                    sample_weight=weights,
+                )
+
+            del X, y, X_imp, X_scaled
+
+        import gc
+
+        gc.collect()
+
+    print(f"[INFO] Done. Coefficients shape: {model.coef_.shape}")
+    return model, imputer, scaler
 
 
 def train_xgboost(
@@ -209,8 +288,81 @@ def main():
     parser.add_argument("--max-depth", type=int, default=6)
     parser.add_argument("--learning-rate", type=float, default=0.1)
     parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="Use online SGD training (memory efficient)",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=3, help="Epochs for online training"
+    )
 
     args = parser.parse_args()
+
+    if args.model == "logistic" and args.online:
+        train_tiles = sorted((args.processed_dir / "train").glob("*.parquet"))
+        n_tiles = len(train_tiles)
+        total_est = n_tiles * 50_000_000
+        pos_frac = 0.11
+        total_pos = int(total_est * pos_frac * args.sample_frac)
+        total_samples = int(total_est * args.sample_frac)
+        class_weights = {
+            0: total_samples / (2 * (total_samples - total_pos)),
+            1: total_samples / (2 * total_pos),
+        }
+        print(f"[INFO] Estimated class weights: {class_weights}")
+
+        model, imputer, scaler = train_sgd_online(
+            args.processed_dir,
+            sample_frac=args.sample_frac,
+            max_epochs=args.epochs,
+            class_weights=class_weights,
+        )
+
+        print("[INFO] Loading val data...")
+        val_df = load_split_data(
+            args.processed_dir, "val", sample_frac=min(0.3, args.sample_frac)
+        )
+        X_val = imputer.transform(val_df.select(FEATURE_COLUMNS).to_numpy())
+        X_val = scaler.transform(X_val).astype(np.float32)
+        y_val = val_df.select(TARGET_COLUMN).to_numpy().ravel().astype(np.int32)
+        del val_df
+
+        print("[INFO] Loading test data...")
+        test_df = load_split_data(
+            args.processed_dir, "test", sample_frac=min(0.3, args.sample_frac)
+        )
+        X_test = imputer.transform(test_df.select(FEATURE_COLUMNS).to_numpy())
+        X_test = scaler.transform(X_test).astype(np.float32)
+        y_test = test_df.select(TARGET_COLUMN).to_numpy().ravel().astype(np.int32)
+        del test_df
+
+        if args.threshold is None:
+            threshold, best_f1 = find_optimal_threshold(model, X_val, y_val)
+            print(f"[INFO] Optimal threshold: {threshold:.4f} (F1: {best_f1:.4f})")
+        else:
+            threshold = args.threshold
+
+        val_metrics = evaluate_model(model, X_val, y_val, threshold)
+        print(
+            f"[INFO] Val: Acc={val_metrics['accuracy']:.4f} F1={val_metrics['f1']:.4f} AUC={val_metrics['roc_auc']:.4f}"
+        )
+
+        test_metrics = evaluate_model(model, X_test, y_test, threshold)
+        print(
+            f"[INFO] Test: Acc={test_metrics['accuracy']:.4f} F1={test_metrics['f1']:.4f} AUC={test_metrics['roc_auc']:.4f}"
+        )
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        with open(args.output_dir / "sgd_model.pkl", "wb") as f:
+            pickle.dump(model, f)
+        with open(args.output_dir / "preprocessors.pkl", "wb") as f:
+            pickle.dump(
+                {"imputer": imputer, "scaler": scaler, "feature_cols": FEATURE_COLUMNS},
+                f,
+            )
+        print(f"[INFO] Saved to {args.output_dir}")
+        return
 
     print(f"[INFO] Loading train data (sample_frac={args.sample_frac})...")
     train_df = load_split_data(
@@ -246,7 +398,7 @@ def main():
 
     # Train
     if args.model == "logistic":
-        model = train_logistic_regression(
+        model = train_logistic_regression_batch(
             X_train, y_train, class_weights, args.max_iter
         )
     else:
