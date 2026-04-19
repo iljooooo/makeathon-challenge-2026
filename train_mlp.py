@@ -153,7 +153,8 @@ class DataStream:
         self.imputer = imputer
         self.scaler = scaler
 
-    def iter_batches(self, progress=None, task_id=None):
+    def _iter_tiles(self):
+        """Loads and preprocesses tiles one by one."""
         indices = list(range(len(self.files)))
         if self.shuffle:
             np.random.shuffle(indices)
@@ -166,7 +167,38 @@ class DataStream:
 
             X = self.scaler.transform(self.imputer.transform(X)).astype(np.float32)
             y = y.astype(np.float32)
+            yield X, y
 
+    def _background_iter_tiles(self):
+        """Prefetches the next tile in a background thread to prevent GPU starvation."""
+        import threading
+        import queue
+
+        q = queue.Queue(maxsize=1)
+
+        def worker():
+            try:
+                for X, y in self._iter_tiles():
+                    q.put((True, (X, y)))
+                q.put((False, None))
+            except Exception as e:
+                q.put((False, e))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        while True:
+            valid, item = q.get()
+            if not valid:
+                if item is not None:
+                    raise item
+                break
+            yield item
+
+    def iter_batches(self, progress=None, task_id=None):
+        # Prefetching tiles keeps the next tile's IO & preprocessing completely overlapped with GPU training.
+        # Yields numpy arrays directly, so switching to JAX/Flax requires no changes here.
+        for X, y in self._background_iter_tiles():
             n = len(X)
             batch_indices = np.arange(n)
             if self.shuffle:
@@ -187,7 +219,7 @@ class DataStream:
             try:
                 df = pl.scan_parquet(pf)
                 total += int(df.select(pl.len()).collect().item())
-            except:
+            except Exception:
                 total += 50_000_000
         avg_per_file = total // max(1, len(self.files[:2]))
         return avg_per_file * len(self.files)
@@ -213,8 +245,9 @@ def train_epoch(
     ema_loss = None
 
     for X_batch, y_batch in stream.iter_batches(progress, train_task):
-        X_tensor = torch.tensor(X_batch, dtype=torch.float32, device=device)
-        y_tensor = torch.tensor(y_batch, dtype=torch.float32, device=device)
+        # torch.from_numpy avoids extra CPU copies before transfer; non_blocking=True pipelines to GPU
+        X_tensor = torch.from_numpy(X_batch).to(device, non_blocking=True)
+        y_tensor = torch.from_numpy(y_batch).to(device, non_blocking=True)
 
         optimizer.zero_grad()
         logits = model(X_tensor)
@@ -232,7 +265,6 @@ def train_epoch(
             ema_loss = 0.9 * ema_loss + 0.1 * batch_loss
 
         if n_batches % log_every == 0:
-            lr = optimizer.param_groups[0]["lr"]
             progress.update(
                 train_task,
                 description=f"[cyan] Train Batch {n_batches}",
@@ -262,7 +294,7 @@ def evaluate(model, stream, device, progress=None, task_id=None, pos_weight=8.0)
 
     with torch.no_grad():
         for X_batch, y_batch in stream.iter_batches(progress, task_id):
-            X_tensor = torch.tensor(X_batch, dtype=torch.float32, device=device)
+            X_tensor = torch.from_numpy(X_batch).to(device, non_blocking=True)
             logits = model(X_tensor)
             probs = torch.sigmoid(logits).cpu().numpy()
 
