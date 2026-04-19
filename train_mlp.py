@@ -3,9 +3,10 @@ MLP training for deforestation detection - batch processing, memory efficient.
 """
 
 import json
+import math
 import pickle
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -28,13 +29,13 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
-    roc_auc_score,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
 from sklearn.preprocessing import StandardScaler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 
 FEATURE_COLUMNS = [
     "evi",
@@ -67,38 +68,47 @@ class HyperParams:
     input_dim: int = len(FEATURE_COLUMNS)
     output_dim: int = 1
     hidden_dims: tuple = (256, 128, 64)
-    learning_rate: float = 1e-4  # Lower LR for large batch size (8192)
+    max_lr: float = 5e-5  # Peak learning rate after warmup
+    min_lr: float = 5e-7  # Minimum LR at end of decay (100x smaller than max)
     weight_decay: float = 1e-5
     batch_size: int = 8192
     epochs: int = 10
     dropout: float = 0.2
     pos_weight: float = 8.0
+    warmup_proportion: float = 0.2  # Fraction of epochs for warmup
 
     def to_dict(self) -> dict:
         return {
             "input_dim": self.input_dim,
             "output_dim": self.output_dim,
             "hidden_dims": list(self.hidden_dims),
-            "learning_rate": self.learning_rate,
+            "max_lr": self.max_lr,
+            "min_lr": self.min_lr,
             "weight_decay": self.weight_decay,
             "batch_size": self.batch_size,
             "epochs": self.epochs,
             "dropout": self.dropout,
             "pos_weight": self.pos_weight,
+            "warmup_proportion": self.warmup_proportion,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "HyperParams":
+        max_lr = float(
+            data.get("max_lr", data.get("learning_rate", 5e-5))
+        )  # Backward compat
         return cls(
             input_dim=int(data.get("input_dim", len(FEATURE_COLUMNS))),
             output_dim=int(data.get("output_dim", 1)),
             hidden_dims=tuple(data.get("hidden_dims", (256, 128, 64))),
-            learning_rate=float(data.get("learning_rate", 1e-3)),
+            max_lr=max_lr,
+            min_lr=float(data.get("min_lr", max_lr * 0.01)),
             weight_decay=float(data.get("weight_decay", 1e-5)),
             batch_size=int(data.get("batch_size", 8192)),
             epochs=int(data.get("epochs", 10)),
             dropout=float(data.get("dropout", 0.2)),
             pos_weight=float(data.get("pos_weight", 8.0)),
+            warmup_proportion=float(data.get("warmup_proportion", 0.2)),
         )
 
     def to_json(self, path: str) -> None:
@@ -128,6 +138,37 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
+
+
+def get_warmup_cosine_schedule(
+    optimizer, warmup_epochs: int, total_epochs: int, max_lr: float, min_lr: float
+):
+    """
+    Create a learning rate schedule with linear warmup and cosine decay.
+
+    Args:
+        optimizer: PyTorch optimizer
+        warmup_epochs: Number of epochs for warmup
+        total_epochs: Total number of training epochs
+        max_lr: Peak learning rate after warmup
+        min_lr: Minimum learning rate at end of training
+
+    Returns:
+        LambdaLR scheduler
+    """
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            # Linear warmup: LR goes from max_lr/warmup_epochs to max_lr
+            return (epoch + 1) / warmup_epochs
+        else:
+            # Cosine decay: LR goes from max_lr to min_lr
+            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+            cos_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            # Scale: min_lr + (max_lr - min_lr) * cos_factor, then divide by max_lr for lambda
+            return min_lr / max_lr + (1 - min_lr / max_lr) * cos_factor
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 class DataStream:
@@ -404,7 +445,15 @@ def main():
     parser.add_argument("--config", type=str, default=None, help="Path to config JSON")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument(
+        "--max-lr", type=float, default=None, help="Peak learning rate after warmup"
+    )
+    parser.add_argument(
+        "--min-lr",
+        type=float,
+        default=None,
+        help="Minimum learning rate at end of training",
+    )
     parser.add_argument("--pos-weight", type=float, default=None)
     parser.add_argument("--log-every", type=int, default=10, help="Log every N batches")
     parser.add_argument(
@@ -422,8 +471,10 @@ def main():
         hp.batch_size = args.batch_size
     if args.epochs:
         hp.epochs = args.epochs
-    if args.learning_rate:
-        hp.learning_rate = args.learning_rate
+    if args.max_lr:
+        hp.max_lr = args.max_lr
+    if args.min_lr:
+        hp.min_lr = args.min_lr
     if args.pos_weight:
         hp.pos_weight = args.pos_weight
 
@@ -443,12 +494,20 @@ def main():
     test_stream.set_preprocessors(imputer, scaler)
 
     model = MLP(hp).to(device)
-    optimizer = AdamW(
-        model.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay
+
+    # Optimizer initialized with max_lr (will be adjusted by scheduler)
+    optimizer = AdamW(model.parameters(), lr=hp.max_lr, weight_decay=hp.weight_decay)
+
+    warmup_epochs = max(1, int(hp.epochs * hp.warmup_proportion))
+    decay_epochs = hp.epochs - warmup_epochs
+    scheduler = get_warmup_cosine_schedule(
+        optimizer,
+        warmup_epochs=warmup_epochs,
+        total_epochs=hp.epochs,
+        max_lr=hp.max_lr,
+        min_lr=hp.min_lr,
     )
-    scheduler = CosineAnnealingLR(
-        optimizer, T_max=hp.epochs, eta_min=hp.learning_rate * 0.01
-    )
+
     criterion = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(hp.pos_weight, device=device)
     )
@@ -456,6 +515,9 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     console.print(f"[bold cyan]Model parameters:[/] {n_params:,}")
     console.print(f"[bold cyan]Architecture:[/] {hp.hidden_dims}")
+    console.print(
+        f"[bold cyan]Learning rate schedule:[/] warmup={warmup_epochs} epochs, decay={decay_epochs} epochs (max_lr={hp.max_lr:.2e} → min_lr={hp.min_lr:.2e})"
+    )
 
     console.print("\n[bold yellow]Estimating dataset sizes...")
     n_train_est = train_stream.estimate_samples()
