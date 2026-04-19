@@ -5,18 +5,33 @@ MLP training for deforestation detection - batch processing, memory efficient.
 import json
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
-from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeColumn
+from rich.box import HEAVY_HEAD, SIMPLE
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.preprocessing import StandardScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -52,7 +67,7 @@ class HyperParams:
     input_dim: int = len(FEATURE_COLUMNS)
     output_dim: int = 1
     hidden_dims: tuple = (256, 128, 64)
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4  # Lower LR for large batch size (8192)
     weight_decay: float = 1e-5
     batch_size: int = 8192
     epochs: int = 10
@@ -147,7 +162,6 @@ class DataStream:
             df = pl.read_parquet(self.files[idx])
             X = df.select(FEATURE_COLUMNS).to_numpy()
             y = df.select(TARGET_COLUMN).to_numpy().ravel()
-            n_samples = len(X)
             del df
 
             X = self.scaler.transform(self.imputer.transform(X)).astype(np.float32)
@@ -162,30 +176,43 @@ class DataStream:
                 end = min(start + self.batch_size, n)
                 batch_idx = batch_indices[start:end]
                 if progress is not None and task_id is not None:
-                    progress.update(task_id, advance=end - start)
+                    progress.update(task_id, advance=1)
                 yield X[batch_idx], y[batch_idx]
 
-            del X, n_samples
+            del X, y
 
     def estimate_samples(self) -> int:
         total = 0
         for pf in self.files[:2]:
             try:
                 df = pl.scan_parquet(pf)
-                total += int(df.select(pl.count()).collect().item())
+                total += int(df.select(pl.len()).collect().item())
             except:
                 total += 50_000_000
-        return total * len(self.files) // min(2, len(self.files))
+        avg_per_file = total // max(1, len(self.files[:2]))
+        return avg_per_file * len(self.files)
+
+    def estimate_batches(self) -> int:
+        n_samples = self.estimate_samples()
+        return n_samples // self.batch_size + 1
 
 
 def train_epoch(
-    model, stream, optimizer, criterion, device, hp, progress=None, task_id=None
+    model,
+    stream,
+    optimizer,
+    criterion,
+    device,
+    progress,
+    train_task,
+    log_every=10,
 ):
     model.train()
     total_loss = 0.0
     n_batches = 0
+    ema_loss = None
 
-    for X_batch, y_batch in stream.iter_batches(progress, task_id):
+    for X_batch, y_batch in stream.iter_batches(progress, train_task):
         X_tensor = torch.tensor(X_batch, dtype=torch.float32, device=device)
         y_tensor = torch.tensor(y_batch, dtype=torch.float32, device=device)
 
@@ -195,13 +222,39 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        batch_loss = loss.item()
+        total_loss += batch_loss
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+        if ema_loss is None:
+            ema_loss = batch_loss
+        else:
+            ema_loss = 0.9 * ema_loss + 0.1 * batch_loss
+
+        if n_batches % log_every == 0:
+            lr = optimizer.param_groups[0]["lr"]
+            progress.update(
+                train_task,
+                description=f"[cyan] Train Batch {n_batches}",
+            )
+
+    avg_loss = total_loss / max(n_batches, 1)
+    return avg_loss, ema_loss
 
 
-def evaluate(model, stream, device, hp, progress=None, task_id=None):
+def weighted_bce_loss(labels, probs, pos_weight):
+    """Compute weighted BCE loss matching training loss."""
+    labels = np.asarray(labels)
+    probs = np.asarray(probs)
+    eps = 1e-8
+    loss = -(
+        pos_weight * labels * np.log(probs + eps)
+        + (1 - labels) * np.log(1 - probs + eps)
+    )
+    return float(np.mean(loss))
+
+
+def evaluate(model, stream, device, progress=None, task_id=None, pos_weight=8.0):
     model.eval()
     all_preds = []
     all_labels = []
@@ -223,29 +276,91 @@ def evaluate(model, stream, device, hp, progress=None, task_id=None):
 
     return {
         "accuracy": float(accuracy_score(all_labels, all_preds)),
+        "recall": float(recall_score(all_labels, all_preds, zero_division=0)),
+        "precision": float(precision_score(all_labels, all_preds, zero_division=0)),
         "f1": float(f1_score(all_labels, all_preds, zero_division=0)),
         "auc": float(roc_auc_score(all_labels, all_probs))
         if len(np.unique(all_labels)) > 1
         else 0.0,
-        "loss": float(
-            -np.mean(
-                all_labels * np.log(all_probs + 1e-8)
-                - (1 - all_labels) * np.log(1 - all_probs + 1e-8)
-            )
-        ),
+        "loss": weighted_bce_loss(all_labels, all_probs, pos_weight),
     }
 
 
-def create_metrics_table() -> Table:
-    table = Table(title="Training Metrics")
-    table.add_column("Epoch", justify="right", style="cyan", width=6)
-    table.add_column("Train Loss", justify="right", style="green", width=10)
-    table.add_column("Val Loss", justify="right", style="yellow", width=10)
-    table.add_column("Val Acc", justify="right", style="magenta", width=10)
-    table.add_column("Val F1", justify="right", style="blue", width=10)
-    table.add_column("Val AUC", justify="right", style="red", width=10)
-    table.add_column("Duration", justify="right", style="white", width=10)
+def print_metrics_legend(console):
+    console.print("\n[bold cyan]Metrics Legend:[/]")
+    console.print(
+        "  Train Loss = Binary Cross Entropy (BCE) - Raw average loss per epoch"
+    )
+    console.print("  Train EMA  = Exponential Moving Average - Smoothed loss (α=0.9)")
+    console.print(
+        "  Val Loss   = Weighted BCE              - Matches training with pos_weight"
+    )
+    console.print("  Acc        = (TP+TN)/N                 - Overall accuracy")
+    console.print(
+        "  Recall     = TP/(TP+FN)                - True positive rate (sensitivity)"
+    )
+    console.print(
+        "  Precision  = TP/(TP+FP)                - Positive predictive value"
+    )
+    console.print(
+        "  F1         = 2PR/(P+R)                 - Harmonic mean of precision and recall"
+    )
+    console.print(
+        "  AUC        = Area under ROC curve      - Classifier discrimination ability"
+    )
+    console.print()
+
+
+def create_metrics_table():
+    table = Table(
+        title="",
+        box=HEAVY_HEAD,
+        show_header=True,
+        header_style="bold cyan",
+        padding=(0, 1),
+    )
+    table.add_column("Epoch", justify="right", style="cyan", width=8)
+    table.add_column("Train Loss", justify="right", style="", width=11)
+    table.add_column("Train EMA", justify="right", style="", width=10)
+    table.add_column("Val Loss", justify="right", style="", width=10)
+    table.add_column("Acc", justify="right", style="cyan", width=8)
+    table.add_column("Recall", justify="right", style="cyan", width=8)
+    table.add_column("Prec", justify="right", style="cyan", width=8)
+    table.add_column("F1", justify="right", style="cyan", width=8)
+    table.add_column("AUC", justify="right", style="cyan", width=8)
+    table.add_column("Time", justify="right", style="cyan", width=8)
     return table
+
+
+def colorize_loss(value, prev_value, is_ema=False):
+    if prev_value is None:
+        return f"[cyan]{value:.4f}[/]"
+    if value < prev_value:
+        return f"[green]{value:.4f}[/]"
+    else:
+        return f"[red]{value:.4f}[/]"
+
+
+def format_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        mins, secs = divmod(int(seconds), 60)
+        return f"{mins}m{secs}s"
+    else:
+        hrs, remainder = divmod(int(seconds), 3600)
+        mins, secs = divmod(remainder, 60)
+        return f"{hrs}h{mins}m"
+
+
+def format_samples(n):
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    elif n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    elif n >= 1e3:
+        return f"{n / 1e3:.1f}K"
+    return str(n)
 
 
 def main():
@@ -259,6 +374,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--pos-weight", type=float, default=None)
+    parser.add_argument("--log-every", type=int, default=10, help="Log every N batches")
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -279,7 +395,8 @@ def main():
     if args.pos_weight:
         hp.pos_weight = args.pos_weight
 
-    console.print(f"[bold cyan]Config:[/] {hp.to_dict()}")
+    config_str = json.dumps(hp.to_dict(), indent=4)
+    console.print(f"\n[bold cyan]Neural Network Config:[/] {config_str}")
 
     device = torch.device(args.device)
     console.print(f"[bold cyan]Device:[/] {device}")
@@ -312,86 +429,160 @@ def main():
     n_train_est = train_stream.estimate_samples()
     n_val_est = val_stream.estimate_samples()
     n_test_est = test_stream.estimate_samples()
-    console.print(f"  Train: ~{n_train_est:,} samples")
-    console.print(f"  Val: ~{n_val_est:,} samples")
+    n_train_batches = train_stream.estimate_batches()
+    n_val_batches = val_stream.estimate_batches()
+    console.print(f"  Train: ~{n_train_est:,} samples (~{n_train_batches:,} batches)")
+    console.print(f"  Val: ~{n_val_est:,} samples (~{n_val_batches:,} batches)")
     console.print(f"  Test: ~{n_test_est:,} samples")
 
-    metrics_table = create_metrics_table()
+    print_metrics_legend(console)
+
+    epoch_data = []
     best_val_auc = 0.0
-    epoch_durations = []
 
-    console.print(f"\n[bold green]Starting training for {hp.epochs} epochs...[/]\n")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeColumn(),
+    progress = Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[cyan][progress.description]{task.description}[/]", justify="left"),
+        BarColumn(bar_width=None, complete_style="cyan", finished_style="cyan"),
+        TextColumn("[cyan][progress.percentage]{task.percentage:>3.0f}%[/]"),
+        TimeRemainingColumn(),
         console=console,
-    ) as progress:
-        epoch_task = progress.add_task("[cyan]Epochs", total=hp.epochs)
+        expand=True,
+    )
 
-        for epoch in range(hp.epochs):
-            epoch_start = time.time()
+    def make_panel(
+        current_epoch=None, n_batches_done=0, current_loss=None, current_ema=None
+    ):
+        table = create_metrics_table()
+        prev_train_loss = None
+        prev_train_ema = None
+        prev_val_loss = None
 
-            progress.update(
-                epoch_task, description=f"[cyan]Epoch {epoch + 1}/{hp.epochs}"
+        for i, (tl, tlema, vl, va, vr, vp, vf, vau, t) in enumerate(epoch_data):
+            train_loss_str = colorize_loss(tl, prev_train_loss)
+            train_ema_str = colorize_loss(tlema, prev_train_ema, is_ema=True)
+            val_loss_str = colorize_loss(vl, prev_val_loss)
+
+            table.add_row(
+                f"[cyan]{i + 1}/{hp.epochs}[/]",
+                train_loss_str,
+                train_ema_str,
+                val_loss_str,
+                f"[cyan]{va:.4f}[/]",
+                f"[cyan]{vr:.4f}[/]",
+                f"[cyan]{vp:.4f}[/]",
+                f"[cyan]{vf:.4f}[/]",
+                f"[cyan]{vau:.4f}[/]",
+                f"[cyan]{format_time(t)}[/]",
             )
 
-            train_task = progress.add_task(f"[green]  Train", total=n_train_est)
-            train_loss = train_epoch(
+            prev_train_loss = tl
+            prev_train_ema = tlema
+            prev_val_loss = vl
+
+        if current_epoch is not None and current_loss is not None:
+            cur_train_str = colorize_loss(current_loss, prev_train_loss)
+            cur_ema_str = (
+                colorize_loss(current_ema, prev_train_ema, is_ema=True)
+                if current_ema
+                else "--"
+            )
+            table.add_row(
+                f"[bold cyan]{current_epoch}/{hp.epochs}[/]",
+                f"[bold]{cur_train_str}[/]",
+                f"[bold]{cur_ema_str}[/]",
+                "[dim]--[/]",
+                "[dim]--[/]",
+                "[dim]--[/]",
+                "[dim]--[/]",
+                "[dim]--[/]",
+                "[dim]--[/]",
+                "[dim]--[/]",
+            )
+
+        return Panel(
+            Group(table, progress),
+            title="[bold blue]Training Metrics[/]",
+            border_style="blue",
+            padding=(1, 2),
+        )
+
+    with Live(console=console, refresh_per_second=4) as live:
+        for epoch in range(1, hp.epochs + 1):
+            epoch_start = time.time()
+
+            train_task = progress.add_task(
+                f"[cyan] Train Batch 0/{n_train_batches}",
+                total=n_train_batches,
+            )
+
+            live.update(make_panel(epoch, 0, None, None))
+
+            avg_train_loss, ema_train_loss = train_epoch(
                 model,
                 train_stream,
                 optimizer,
                 criterion,
                 device,
-                hp,
                 progress,
                 train_task,
+                log_every=args.log_every,
             )
             progress.remove_task(train_task)
 
-            val_task = progress.add_task(f"[yellow]  Val", total=n_val_est)
-            val_metrics = evaluate(model, val_stream, device, hp, progress, val_task)
+            val_task = progress.add_task(
+                f"[cyan] Val Batch 0/{n_val_batches}",
+                total=n_val_batches,
+            )
+            live.update(
+                make_panel(epoch, n_train_batches, avg_train_loss, ema_train_loss)
+            )
+
+            val_metrics = evaluate(
+                model, val_stream, device, progress, val_task, pos_weight=hp.pos_weight
+            )
             progress.remove_task(val_task)
 
             epoch_duration = time.time() - epoch_start
-            epoch_durations.append(epoch_duration)
+            epoch_data.append(
+                (
+                    avg_train_loss,
+                    ema_train_loss,
+                    val_metrics["loss"],
+                    val_metrics["accuracy"],
+                    val_metrics["recall"],
+                    val_metrics["precision"],
+                    val_metrics["f1"],
+                    val_metrics["auc"],
+                    epoch_duration,
+                )
+            )
 
             scheduler.step()
-
-            metrics_table.add_row(
-                str(epoch + 1),
-                f"{train_loss:.4f}",
-                f"{val_metrics['loss']:.4f}",
-                f"{val_metrics['accuracy']:.4f}",
-                f"{val_metrics['f1']:.4f}",
-                f"{val_metrics['auc']:.4f}",
-                f"{epoch_duration:.1f}s",
-            )
 
             if val_metrics["auc"] > best_val_auc:
                 best_val_auc = val_metrics["auc"]
                 args.output_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), args.output_dir / "mlp_best.pt")
 
-            progress.advance(epoch_task)
+            live.update(make_panel())
 
-    console.print("\n")
-    console.print(metrics_table)
-
-    avg_duration = sum(epoch_durations) / len(epoch_durations)
-    console.print(f"\n[bold cyan]Average epoch duration:[/] {avg_duration:.1f}s")
+    if epoch_data:
+        avg_duration = sum(e[8] for e in epoch_data) / len(epoch_data)
+        console.print(
+            f"\n[bold cyan]Average epoch duration:[/] {format_time(avg_duration)}"
+        )
 
     console.print("\n[bold yellow]Loading best model and evaluating on test...")
     model.load_state_dict(torch.load(args.output_dir / "mlp_best.pt"))
-    test_metrics = evaluate(model, test_stream, device, hp)
+    test_metrics = evaluate(model, test_stream, device, pos_weight=hp.pos_weight)
 
-    test_table = Table(title="Test Results")
+    test_table = Table(title="Test Results", box=SIMPLE, padding=(0, 2))
     test_table.add_column("Metric", style="cyan", width=15)
-    test_table.add_column("Value", justify="right", style="green", width=10)
+    test_table.add_column("Value", justify="right", style="cyan", width=10)
     test_table.add_row("Accuracy", f"{test_metrics['accuracy']:.4f}")
+    test_table.add_row("Recall", f"{test_metrics['recall']:.4f}")
+    test_table.add_row("Precision", f"{test_metrics['precision']:.4f}")
     test_table.add_row("F1 Score", f"{test_metrics['f1']:.4f}")
     test_table.add_row("AUC", f"{test_metrics['auc']:.4f}")
     console.print(test_table)
