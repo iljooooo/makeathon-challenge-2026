@@ -1,17 +1,13 @@
 """
-Dataset and DataLoader utilities for deforestation detection.
+Dataset utilities for deforestation detection.
 
-Provides:
-- StreamingParquetDataset: PyTorch IterableDataset for memory-efficient streaming
-- ProcessedDataModule: High-level API for all models (PyTorch, XGBoost, sklearn)
+Loads preprocessed parquet files, applies imputation and scaling on-the-fly.
 """
 
 import numpy as np
 import polars as pl
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Iterator
-import torch
-from torch.utils.data import IterableDataset, DataLoader
+from typing import List, Tuple, Optional, Dict
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 import pickle
@@ -41,247 +37,170 @@ FEATURE_COLUMNS = [
 ]
 
 TARGET_COLUMN = "deforestation_target"
-FILTER_COLUMN = "forest_2020"
-METADATA_COLUMNS = ["tile_id", "split", "year", "month"]
-
-VAL_TILES = ["18NWG_6_6", "18NWH_1_4", "18NXH_6_8", "18NWM_9_4"]
-TEST_TILES = ["18NVJ_1_6", "18NYH_2_1", "33NTE_5_1", "47QMA_6_2", "48PWA_0_6"]
-
-
-def assign_split(tile_id: str) -> str:
-    if tile_id in VAL_TILES:
-        return "val"
-    elif tile_id in TEST_TILES:
-        return "test"
-    return "train"
-
-
-class StreamingParquetDataset(IterableDataset):
-    """
-    PyTorch IterableDataset that streams parquet tiles.
-
-    Memory-efficient: Loads max `max_parquets_in_memory` tiles at a time.
-
-    Args:
-        parquet_dir: Directory containing {tile_id}.parquet files
-        split: "train", "val", or "test"
-        feature_cols: List of feature columns
-        imputer: Fitted SimpleImputer
-        scaler: Fitted StandardScaler
-        max_parquets_in_memory: Maximum parquet files loaded simultaneously
-    """
-
-    def __init__(
-        self,
-        parquet_dir: Path,
-        split: str,
-        feature_cols: List[str],
-        imputer: SimpleImputer,
-        scaler: StandardScaler,
-        max_parquets_in_memory: int = 4,
-    ):
-        self.parquet_dir = Path(parquet_dir)
-        self.split = split
-        self.feature_cols = feature_cols
-        self.imputer = imputer
-        self.scaler = scaler
-        self.max_parquets_in_memory = max_parquets_in_memory
-
-        parquet_files = sorted(self.parquet_dir.glob("*.parquet"))
-
-        self.tile_parquet_files = {}
-        for pf in parquet_files:
-            tile_id = pf.stem
-            self.tile_parquet_files[tile_id] = pf
-
-        self.split_tiles = self._get_split_tiles()
-
-    def _get_split_tiles(self) -> List[str]:
-        split_tiles = []
-        for tile_id in self.tile_parquet_files:
-            assigned = assign_split(tile_id)
-            if assigned == self.split:
-                split_tiles.append(tile_id)
-        return split_tiles
-
-    def _load_and_process_parquet(
-        self, tile_id: str
-    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        pf = self.tile_parquet_files[tile_id]
-        keep_cols = (
-            METADATA_COLUMNS + self.feature_cols + [TARGET_COLUMN, FILTER_COLUMN]
-        )
-
-        df = pl.read_parquet(pf, columns=keep_cols)
-
-        df = df.filter(pl.col(FILTER_COLUMN) == 1)
-        df = df.filter(pl.col(TARGET_COLUMN).is_not_nan())
-        df = df.drop(FILTER_COLUMN)
-
-        if df.height == 0:
-            return
-
-        X = df.select(self.feature_cols).to_numpy()
-        y = df.select(TARGET_COLUMN).to_numpy().ravel()
-
-        X_imputed = self.imputer.transform(X)
-        X_scaled = self.scaler.transform(X_imputed)
-
-        for i in range(len(X_scaled)):
-            yield (
-                torch.tensor(X_scaled[i], dtype=torch.float32),
-                torch.tensor(y[i], dtype=torch.float32),
-            )
-
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        worker_info = torch.utils.data.get_worker_info()
-
-        if worker_info is None:
-            tile_ids = self.split_tiles
-        else:
-            tiles_per_worker = len(self.split_tiles) // worker_info.num_workers
-            worker_id = worker_info.id
-            start = worker_id * tiles_per_worker
-            end = (
-                start + tiles_per_worker
-                if worker_id < worker_info.num_workers - 1
-                else len(self.split_tiles)
-            )
-            tile_ids = self.split_tiles[start:end]
-
-        for tile_id in tile_ids:
-            yield from self._load_and_process_parquet(tile_id)
-
-    def __len__(self) -> int:
-        return len(self.split_tiles)
 
 
 class ProcessedDataModule:
     """
     High-level data module for all models.
 
-    Provides:
-    - get_dataloader(): PyTorch DataLoader for neural networks
-    - get_numpy(): NumPy arrays for XGBoost/sklearn
-    - get_class_weights(): Class weights for imbalanced loss
+    Loads parquet files, fits imputer/scaler on train data,
+    applies to val/test.
 
     Args:
-        processed_dir: Directory containing {train,val,test}.npz files
-        parquet_dir: Directory containing {tile_id}.parquet files (for streaming)
-        imputer: Fitted SimpleImputer (or path to preprocessors.pkl)
-        scaler: Fitted StandardScaler (or path to preprocessors.pkl)
+        processed_dir: Directory containing train/, val/, test/ subdirectories
     """
 
-    def __init__(
-        self,
-        processed_dir: Optional[Path] = None,
-        parquet_dir: Optional[Path] = None,
-        imputer: Optional[SimpleImputer] = None,
-        scaler: Optional[StandardScaler] = None,
-    ):
-        self.processed_dir = Path(processed_dir) if processed_dir else None
-        self.parquet_dir = Path(parquet_dir) if parquet_dir else None
+    def __init__(self, processed_dir: Path):
+        self.processed_dir = Path(processed_dir)
+        self.feature_cols = self._load_feature_cols()
+        self.imputer = None
+        self.scaler = None
+        self._cached_splits = {}
 
-        if imputer is None or scaler is None:
-            if self.processed_dir:
-                self.imputer, self.scaler, self.feature_cols = (
-                    self._load_preprocessors()
-                )
-            else:
-                raise ValueError("Must provide either imputer/scaler or processed_dir")
-        else:
-            self.imputer = imputer
-            self.scaler = scaler
-            self.feature_cols = FEATURE_COLUMNS
+    def _load_feature_cols(self) -> List[str]:
+        """Load feature columns from features.parquet."""
+        feature_path = self.processed_dir / "features.parquet"
+        if feature_path.exists():
+            df = pl.read_parquet(feature_path)
+            return df["feature"].to_list()
+        return FEATURE_COLUMNS.copy()
 
-        self._cached_data = {}
+    def _fit_preprocessors(
+        self, X_train: np.ndarray
+    ) -> Tuple[SimpleImputer, StandardScaler]:
+        """Fit imputer and scaler on training data."""
+        print(
+            f"[INFO] Fitting imputer and scaler on {X_train.shape[0]:,} training samples..."
+        )
 
-    def _load_preprocessors(self) -> Tuple[SimpleImputer, StandardScaler, List[str]]:
-        with open(self.processed_dir / "preprocessors.pkl", "rb") as f:
-            data = pickle.load(f)
-        return data["imputer"], data["scaler"], data["feature_cols"]
+        imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+        X_imputed = imputer.fit_transform(X_train)
 
-    def _load_numpy_split(self, split: str) -> Tuple[np.ndarray, np.ndarray]:
-        if split not in self._cached_data:
-            data = np.load(self.processed_dir / f"{split}.npz")
-            self._cached_data[split] = (data["X"], data["y"])
-        return self._cached_data[split]
+        scaler = StandardScaler()
+        scaler.fit(X_imputed)
 
-    def get_numpy(self, split: str) -> Tuple[np.ndarray, np.ndarray]:
+        print(f"[INFO] Median imputer fitted for {len(self.feature_cols)} features")
+        print(f"[INFO] Scaler mean: {scaler.mean_[:5]}... (first 5)")
+
+        return imputer, scaler
+
+    def _load_split_parquets(self, split: str) -> pl.DataFrame:
+        """Load all parquet files for a split."""
+        split_dir = self.processed_dir / split
+        if not split_dir.exists():
+            return pl.DataFrame()
+
+        parquet_files = sorted(split_dir.glob("*.parquet"))
+        if not parquet_files:
+            return pl.DataFrame()
+
+        dfs = [pl.read_parquet(pf) for pf in parquet_files]
+        return pl.concat(dfs)
+
+    def _prepare_numpy(
+        self, df: pl.DataFrame, fit: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert polars df to numpy arrays."""
+        X = df.select(self.feature_cols).to_numpy()
+        y = df.select(TARGET_COLUMN).to_numpy().ravel()
+
+        if fit:
+            self.imputer, self.scaler = self._fit_preprocessors(X)
+
+        X_imputed = self.imputer.transform(X)
+        X_scaled = self.scaler.transform(X_imputed).astype(np.float32)
+        y = y.astype(np.float32)
+
+        return X_scaled, y
+
+    def get_numpy(self, split: str, fit: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get NumPy arrays for a split.
 
         Args:
             split: "train", "val", or "test"
+            fit: If True, fit imputer/scaler on this data
 
         Returns:
             X: (n_samples, n_features) array
             y: (n_samples,) array
         """
-        return self._load_numpy_split(split)
+        if split in self._cached_splits:
+            return self._cached_splits[split]
 
-    def get_dataloader(
-        self,
-        split: str,
-        batch_size: int = 1024,
-        num_workers: int = 4,
-        shuffle: bool = True,
-    ) -> DataLoader:
-        """
-        Get PyTorch DataLoader for a split.
+        df = self._load_split_parquets(split)
+        if df.height == 0:
+            return np.array([]), np.array([])
 
-        Args:
-            split: "train", "val", or "test"
-            batch_size: Batch size
-            num_workers: Number of parallel data loaders
-            shuffle: Shuffle batches (only for train)
+        X, y = self._prepare_numpy(df, fit=fit)
 
-        Returns:
-            DataLoader
-        """
-        if self.parquet_dir is None:
-            X, y = self.get_numpy(split)
-            dataset = torch.utils.data.TensorDataset(
-                torch.tensor(X, dtype=torch.float32),
-                torch.tensor(y, dtype=torch.float32),
-            )
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle if split == "train" else False,
-                num_workers=0,
-            )
+        del df
 
-        dataset = StreamingParquetDataset(
-            parquet_dir=self.parquet_dir,
-            split=split,
-            feature_cols=self.feature_cols,
-            imputer=self.imputer,
-            scaler=self.scaler,
-        )
+        self._cached_splits[split] = (X, y)
+        return X, y
 
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=True,
-        )
+    def clear_cache(self):
+        """Clear cached split data to free memory."""
+        self._cached_splits.clear()
 
     def get_class_weights(self) -> Dict[int, float]:
-        """Get class weights computed from training data."""
-        data = np.load(self.processed_dir / "class_weights.npz")
-        weights = data["weights"]
-        return {0: float(weights[0]), 1: float(weights[1])}
+        """Get class weights from metadata."""
+        meta_path = self.processed_dir / "metadata.parquet"
+        if not meta_path.exists():
+            # Compute from train data
+            X_train, y_train = self.get_numpy("train", fit=True)
+            total = len(y_train)
+            pos = y_train.sum()
+            neg = total - pos
+            return {
+                0: total / (2 * neg) if neg > 0 else 1.0,
+                1: total / (2 * pos) if pos > 0 else 1.0,
+            }
 
+        meta = pl.read_parquet(meta_path)
+        train_count = meta.filter(
+            (pl.col("split") == "train") & (pl.col("metric") == "count")
+        )["value"][0]
+        train_positive = meta.filter(
+            (pl.col("split") == "train") & (pl.col("metric") == "positive")
+        )["value"][0]
+        train_negative = train_count - train_positive
 
-def get_class_weights_numpy(y: np.ndarray) -> Dict[int, float]:
-    """Compute class weights from labels array."""
-    unique, counts = np.unique(y, return_counts=True)
-    total = len(y)
-    weights = {}
-    for cls, count in zip(unique, counts):
-        weights[cls] = total / (2 * count)
-    return weights
+        return {
+            0: train_count / (2 * train_negative) if train_negative > 0 else 1.0,
+            1: train_count / (2 * train_positive) if train_positive > 0 else 1.0,
+        }
+
+    def save_preprocessors(self, output_path: Path = None):
+        """Save imputer and scaler."""
+        if output_path is None:
+            output_path = self.processed_dir / "preprocessors.pkl"
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, "wb") as f:
+            pickle.dump(
+                {
+                    "imputer": self.imputer,
+                    "scaler": self.scaler,
+                    "feature_cols": self.feature_cols,
+                },
+                f,
+            )
+        print(f"[INFO] Saved preprocessors to {output_path}")
+
+    def load_preprocessors(self, input_path: Path = None):
+        """Load imputer and scaler."""
+        if input_path is None:
+            input_path = self.processed_dir / "preprocessors.pkl"
+        input_path = Path(input_path)
+
+        with open(input_path, "rb") as f:
+            data = pickle.load(f)
+        self.imputer = data["imputer"]
+        self.scaler = data["scaler"]
+        self.feature_cols = data["feature_cols"]
+        print(f"[INFO] Loaded preprocessors from {input_path}")
 
 
 if __name__ == "__main__":
@@ -289,22 +208,20 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Test dataset loading")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
-    parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--num-workers", type=int, default=4)
 
     args = parser.parse_args()
 
     dm = ProcessedDataModule(processed_dir=args.processed_dir)
 
-    print("[INFO] Testing numpy loading...")
-    X_train, y_train = dm.get_numpy("train")
+    print("[INFO] Loading train data and fitting preprocessors...")
+    X_train, y_train = dm.get_numpy("train", fit=True)
     print(f"Train: X={X_train.shape}, y={y_train.shape}")
+    print(f"Positive class: {y_train.sum():,} ({y_train.mean() * 100:.2f}%)")
 
-    print("[INFO] Testing DataLoader...")
-    train_loader = dm.get_dataloader("train", batch_size=args.batch_size)
-    for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
-        print(f"Batch {batch_idx}: X={X_batch.shape}, y={y_batch.shape}")
-        if batch_idx >= 2:
-            break
+    print("[INFO] Loading val data...")
+    X_val, y_val = dm.get_numpy("val")
+    print(f"Val: X={X_val.shape}, y={y_val.shape}")
 
     print("[INFO] Class weights:", dm.get_class_weights())
+
+    dm.save_preprocessors()
